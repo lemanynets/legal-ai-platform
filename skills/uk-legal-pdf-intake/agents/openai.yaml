@@ -1,0 +1,4 @@
+interface:
+  display_name: "UK Legal PDF Intake"
+  short_description: "Extend UK legal PDF intake flow"
+  default_prompt: "Use $uk-legal-pdf-intake to add or refine UK legal PDF intake in this repo."
