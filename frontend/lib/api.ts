@@ -1734,6 +1734,7 @@ export type ContractAnalysisItem = {
   ai_model: string | null;
   tokens_used: number | null;
   processing_time_ms: number | null;
+  tags?: string[];
   created_at: string;
   usage: SubscriptionResponse["usage"];
 };
@@ -3646,6 +3647,7 @@ export type DocumentIntakeResponse = {
   classifier_confidence: number | null;
   classifier_model: string | null;
   raw_text_preview: string | null;
+  tags?: string[];
   created_at: string;
   cache_hit?: boolean;
   usage: SubscriptionResponse["usage"];

@@ -74,6 +74,7 @@ export default function AnalyzePage() {
   const [selectedCaseId, setSelectedCaseId] = useState<string>("");
   const [showCreateCaseModal, setShowCreateCaseModal] = useState(false);
   const [newCaseTitle, setNewCaseTitle] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
 
   const intakeResult = intakeResults[activeResultIndex] ?? null;
 
@@ -482,6 +483,27 @@ export default function AnalyzePage() {
             ))}
           </div>
 
+          {!!intakeResult.tags?.length && (
+            <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "18px" }}>
+              {intakeResult.tags.map((tag) => (
+                <span
+                  key={tag}
+                  style={{
+                    padding: "4px 12px",
+                    borderRadius: "999px",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    background: "rgba(212,168,67,0.1)",
+                    color: "var(--gold-400)",
+                    border: "1px solid rgba(212,168,67,0.2)",
+                  }}
+                >
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
+
           <div
             style={{
               display: "grid",
@@ -804,7 +826,23 @@ export default function AnalyzePage() {
 
         <div className="card-elevated" style={{ padding: "24px" }}>
           <h2 style={{ fontSize: "22px", marginBottom: "8px" }}>Історія швидких аналізів</h2>
-          <p style={{ color: "var(--text-secondary)", marginBottom: "18px" }}>{history?.total || 0} записів</p>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", marginBottom: "18px" }}>
+            <p style={{ color: "var(--text-secondary)", margin: 0 }}>{history?.total || 0} записів</p>
+            {(() => {
+              const allTags = Array.from(new Set((history?.items || []).flatMap((i) => i.tags || [])));
+              if (allTags.length === 0) return null;
+              return (
+                <select
+                  value={tagFilter}
+                  onChange={(e) => setTagFilter(e.target.value)}
+                  style={{ fontSize: "12px", padding: "4px 10px", borderRadius: "8px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#fff" }}
+                >
+                  <option value="">Всі теги</option>
+                  {allTags.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              );
+            })()}
+          </div>
 
           {quickResult && (
             <div className="card-elevated" style={{ padding: "14px", marginBottom: "14px", borderLeft: "3px solid var(--gold-500)" }}>
@@ -830,7 +868,9 @@ export default function AnalyzePage() {
 
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {history?.items?.length ? (
-              history.items.map((item) => (
+              history.items
+                .filter((item) => !tagFilter || (item.tags || []).includes(tagFilter))
+                .map((item) => (
                 <div key={item.id} className="card-elevated" style={{ padding: "12px 14px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: "12px" }}>
                     <div>
@@ -849,6 +889,21 @@ export default function AnalyzePage() {
                       {item.risk_level || "—"}
                     </span>
                   </div>
+                  {!!item.tags?.length && (
+                    <div style={{ display: "flex", gap: "4px", flexWrap: "wrap", marginTop: "8px" }}>
+                      {item.tags.map((tag) => (
+                        <span key={tag} style={{
+                          padding: "2px 8px",
+                          borderRadius: "999px",
+                          fontSize: "10px",
+                          fontWeight: 700,
+                          background: "rgba(212,168,67,0.1)",
+                          color: "var(--gold-400)",
+                          border: "1px solid rgba(212,168,67,0.15)",
+                        }}>{tag}</span>
+                      ))}
+                    </div>
+                  )}
                   {item.summary && <p style={{ marginTop: "8px", color: "var(--text-secondary)", fontSize: "13px" }}>{item.summary}</p>}
                 </div>
               ))
