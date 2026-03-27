@@ -32,6 +32,20 @@ function buildCaseLawSeed(result: DocumentIntakeResponse): string {
   return [result.subject_matter, result.classified_type, result.primary_party_role].filter(Boolean).join(" ").trim();
 }
 
+/**
+ * Runs `fn` over all `items` with at most `limit` concurrent calls at a time.
+ * Processes items in order, waits for each chunk before starting the next.
+ */
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<void>
+): Promise<void> {
+  for (let i = 0; i < items.length; i += limit) {
+    await Promise.all(items.slice(i, i + limit).map((item, j) => fn(item, i + j)));
+  }
+}
+
 export default function AnalyzePage() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [quickFileName, setQuickFileName] = useState("");
@@ -95,12 +109,13 @@ export default function AnalyzePage() {
     setGdprResult(null);
     setActiveResultIndex(0);
 
-    const results: DocumentIntakeResponse[] = [];
+    const orderedResults: (DocumentIntakeResponse | null)[] = new Array(selectedFiles.length).fill(null);
     const errors: Record<string, string> = {};
+    let completedCount = 0;
 
-    for (let i = 0; i < selectedFiles.length; i++) {
-      const file = selectedFiles[i];
-      setIntakeProgress(`Аналізую файл ${i + 1} з ${selectedFiles.length}: ${file.name}...`);
+    setIntakeProgress(`Аналізую 0 з ${selectedFiles.length} файлів...`);
+
+    await runWithConcurrency(selectedFiles, 3, async (file, index) => {
       try {
         const result = await analyzeIntake(
           { file, jurisdiction, case_id: selectedCaseId || undefined },
@@ -108,11 +123,16 @@ export default function AnalyzePage() {
           getUserId(),
           { mode: intakeMode }
         );
-        results.push(result);
+        orderedResults[index] = result;
       } catch (err) {
         errors[file.name] = String(err);
+      } finally {
+        completedCount++;
+        setIntakeProgress(`Аналізую ${completedCount} з ${selectedFiles.length} файлів...`);
       }
-    }
+    });
+
+    const results = orderedResults.filter((r): r is DocumentIntakeResponse => r !== null);
 
     setIntakeResults(results);
     setIntakeErrors(errors);
