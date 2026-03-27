@@ -14,7 +14,9 @@ import {
   type GenerateResponse,
   type GenerateBundleResponse,
   type TargetLanguage,
+  type StreamEvent,
   generateDocument,
+  generateDocumentStream,
   getCase,
   getCaseLawDigest,
   getCaseLawDigestDetail,
@@ -107,6 +109,7 @@ export default function GeneratePage() {
   const [kbLoading, setKbLoading] = useState(false);
   const [savingToKb, setSavingToKb] = useState(false);
   const [isSavedToKb, setIsSavedToKb] = useState(false);
+  const [genProgress, setGenProgress] = useState("");
 
   // Bundle states
   const [isBundleMode, setIsBundleMode] = useState(false);
@@ -398,12 +401,20 @@ export default function GeneratePage() {
     setIsSavedToKb(false);
     setError("");
     setInfo("");
+    setGenProgress("");
 
     const targetType = isBundleMode ? "bundle" : selectedDocType;
 
-    generateDocument(targetType, payload, tariff, getToken(), getUserId(), options)
+    generateDocumentStream(
+      targetType, payload, tariff,
+      (event: StreamEvent) => {
+        if (event.message) setGenProgress(event.message);
+      },
+      getToken(), getUserId(), options
+    )
       .then((data) => {
         setResult(data);
+        setGenProgress("");
         if ("bundle_id" in data) {
           setInfo(`Пакет документів згенеровано (ID: ${data.bundle_id}).`);
         } else {
@@ -849,6 +860,11 @@ export default function GeneratePage() {
               "Згенерувати"
             )}
           </button>
+          {loading && genProgress && (
+            <div style={{ marginTop: "10px", padding: "10px 14px", background: "rgba(212,168,67,0.08)", borderRadius: "12px", fontSize: "13px", color: "var(--gold-400)", fontWeight: 600 }}>
+              {genProgress}
+            </div>
+          )}
         </form>
 
         {result && (

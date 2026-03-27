@@ -6,11 +6,14 @@ import React, { FormEvent, useEffect, useState } from "react";
 import { getToken, getUserId } from "@/lib/auth";
 import {
   analyzeIntake,
+  analyzeIntakeStream,
+  analyzeGdprCompliance,
   createCase,
   type ContractAnalysisHistoryResponse,
   type GdprComplianceResponse,
   type ContractAnalysisItem,
   type DocumentIntakeResponse,
+  type StreamEvent,
   getCase,
   getCases,
   getContractAnalysisHistory,
@@ -19,7 +22,6 @@ import {
 } from "@/lib/api";
 
 const CASE_LAW_SEED_KEY = "legal_ai_case_law_seed_v1";
-import { analyzeGdprCompliance } from "@/lib/api";
 
 function riskTone(level?: string | null) {
   const value = String(level || "").toLowerCase();
@@ -117,8 +119,13 @@ export default function AnalyzePage() {
 
     await runWithConcurrency(selectedFiles, 3, async (file, index) => {
       try {
-        const result = await analyzeIntake(
+        const result = await analyzeIntakeStream(
           { file, jurisdiction, case_id: selectedCaseId || undefined },
+          (event: StreamEvent) => {
+            if (event.message) {
+              setIntakeProgress(`[${file.name}] ${event.message}`);
+            }
+          },
           getToken(),
           getUserId(),
           { mode: intakeMode }

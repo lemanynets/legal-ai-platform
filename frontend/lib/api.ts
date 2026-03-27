@@ -2147,6 +2147,104 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return (await response.json()) as T;
 }
 
+// ---------------------------------------------------------------------------
+// Reusable SSE stream reader
+// ---------------------------------------------------------------------------
+
+export type StreamEvent = {
+  step?: string;
+  status?: string;
+  message?: string;
+  progress?: number;
+  result?: unknown;
+  [key: string]: unknown;
+};
+
+/**
+ * Generic SSE stream reader for long-running POST endpoints.
+ *
+ * Sends a JSON-body POST request, reads the response as an SSE stream,
+ * fires `onEvent` for each parsed `data:` line, and returns the final
+ * result extracted from the last event that contains a `result` field.
+ *
+ * If the endpoint does not return a stream (e.g. returns plain JSON),
+ * it transparently falls back to parsing the response as JSON.
+ */
+async function streamRequest<T>(
+  path: string,
+  options: RequestOptions & { onEvent: (event: StreamEvent) => void }
+): Promise<T> {
+  const response = await safeFetch(`${API_BASE}${path}`, {
+    method: options.method ?? "POST",
+    headers: buildHeaders(options.token, options.demoUser),
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw await buildApiError(response);
+  }
+
+  // Fallback: if server returns plain JSON instead of a stream
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream") && !response.body) {
+    return (await response.json()) as T;
+  }
+
+  if (!response.body) {
+    throw new ApiClientError("Сервер не повернув потік даних.", { raw: "No response body" });
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let finalResult: T | null = null;
+  let buffer = "";
+
+  const processLine = (line: string) => {
+    if (!line.startsWith("data: ")) return;
+    const dataStr = line.slice(6).trim();
+    if (!dataStr) return;
+    try {
+      const parsed = JSON.parse(dataStr) as StreamEvent;
+      options.onEvent(parsed);
+      if (parsed.result !== undefined) {
+        finalResult = parsed.result as T;
+      }
+    } catch {
+      // skip unparseable lines
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      processLine(line);
+    }
+  }
+
+  // Flush remaining buffer
+  if (buffer.trim()) {
+    processLine(buffer);
+  }
+
+  // If no streaming result was captured, try parsing the full response
+  // (handles edge case where server sends a single JSON blob instead of SSE)
+  if (finalResult === null) {
+    throw new ApiClientError(
+      "Потік завершився без фінального результату.",
+      { raw: "Stream closed without final result." }
+    );
+  }
+
+  return finalResult;
+}
+
 export async function getDocumentTypes(): Promise<DocumentType[]> {
   const data = await request<{ items: DocumentType[] }>("/api/documents/types");
   return data.items;
@@ -4047,4 +4145,153 @@ export async function getCompanyDetails(
     token,
     demoUser,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Streaming variants of long-running endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * Streaming intake analysis.
+ * Falls back to the non-streaming analyzeIntake() if the server
+ * does not support the streaming endpoint.
+ */
+export async function analyzeIntakeStream(
+  payload: { file: File; jurisdiction?: string; case_id?: string },
+  onEvent: (event: StreamEvent) => void,
+  token?: string,
+  demoUser?: string,
+  options?: { mode?: "standard" | "deep" }
+): Promise<DocumentIntakeResponse> {
+  const form = new FormData();
+  form.append("file", payload.file);
+  if (payload.jurisdiction) form.append("jurisdiction", payload.jurisdiction);
+  if (payload.case_id) form.append("case_id", payload.case_id);
+
+  const mode = options?.mode || "standard";
+
+  let response: Response;
+  try {
+    response = await safeFetch(`${API_BASE}/api/analyze/intake-stream?mode=${mode}`, {
+      method: "POST",
+      headers: buildAuthHeaders(token, demoUser),
+      body: form,
+      cache: "no-store",
+    });
+  } catch {
+    // Network error on stream endpoint — fall back to non-streaming
+    return analyzeIntake(payload, token, demoUser, options);
+  }
+
+  // If stream endpoint returns 404, fall back to regular endpoint
+  if (response.status === 404) {
+    return analyzeIntake(payload, token, demoUser, options);
+  }
+
+  if (!response.ok) {
+    throw await buildApiError(response);
+  }
+
+  // If server returned JSON instead of SSE, parse directly
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    return (await response.json()) as DocumentIntakeResponse;
+  }
+
+  if (!response.body) {
+    return analyzeIntake(payload, token, demoUser, options);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let finalResult: DocumentIntakeResponse | null = null;
+  let buffer = "";
+
+  const processLine = (line: string) => {
+    if (!line.startsWith("data: ")) return;
+    const dataStr = line.slice(6).trim();
+    if (!dataStr) return;
+    try {
+      const parsed = JSON.parse(dataStr) as StreamEvent;
+      onEvent(parsed);
+      if (parsed.result !== undefined) {
+        finalResult = parsed.result as DocumentIntakeResponse;
+      }
+    } catch { /* skip */ }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) processLine(line);
+  }
+  if (buffer.trim()) processLine(buffer);
+
+  if (!finalResult) {
+    throw new ApiClientError("Потік завершився без фінального результату.", { raw: "intake stream" });
+  }
+  return finalResult;
+}
+
+/**
+ * Streaming document generation.
+ * Falls back to the non-streaming generateDocument() if the server
+ * does not support the streaming endpoint.
+ */
+export async function generateDocumentStream(
+  docType: string,
+  formData: Record<string, unknown>,
+  tariff: string,
+  onEvent: (event: StreamEvent) => void,
+  token?: string,
+  demoUser?: string,
+  options?: Parameters<typeof generateDocument>[5]
+): Promise<GenerateResponse | GenerateBundleResponse> {
+  const body = { doc_type: docType, form_data: formData, tariff, ...options };
+
+  try {
+    return await streamRequest<GenerateResponse | GenerateBundleResponse>(
+      "/api/documents/generate-stream",
+      { method: "POST", body, token, demoUser, onEvent }
+    );
+  } catch (err) {
+    // If stream endpoint is unavailable (404, network), fall back
+    if (
+      err instanceof ApiClientError &&
+      (err.status === 404 || err.isNetwork)
+    ) {
+      return generateDocument(docType, formData, tariff, token, demoUser, options);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Streaming strategy blueprint creation.
+ * Falls back to the non-streaming createStrategyBlueprint() if the server
+ * does not support the streaming endpoint.
+ */
+export async function createStrategyBlueprintStream(
+  payload: Parameters<typeof createStrategyBlueprint>[0],
+  onEvent: (event: StreamEvent) => void,
+  token?: string,
+  demoUser?: string
+): Promise<StrategyBlueprintResponse> {
+  try {
+    return await streamRequest<StrategyBlueprintResponse>(
+      "/api/strategy/blueprint-stream",
+      { method: "POST", body: payload, token, demoUser, onEvent }
+    );
+  } catch (err) {
+    if (
+      err instanceof ApiClientError &&
+      (err.status === 404 || err.isNetwork)
+    ) {
+      return createStrategyBlueprint(payload, token, demoUser);
+    }
+    throw err;
+  }
 }
