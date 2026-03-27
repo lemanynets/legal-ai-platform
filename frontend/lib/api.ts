@@ -3488,6 +3488,7 @@ export type DocumentIntakeResponse = {
   classifier_model: string | null;
   raw_text_preview: string | null;
   created_at: string;
+  cache_hit?: boolean;
   usage: SubscriptionResponse["usage"];
 };
 

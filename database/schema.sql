@@ -94,6 +94,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS intake_analysis_cache (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,
+    jurisdiction VARCHAR(10) NOT NULL DEFAULT 'UA',
+    mode VARCHAR(20) NOT NULL DEFAULT 'standard',
+    source_file_name VARCHAR(500),
+    result JSONB NOT NULL,
+    ai_model VARCHAR(100),
+    tokens_used INT,
+    processing_time_ms INT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '30 days'),
+    CONSTRAINT uq_intake_cache_key UNIQUE (user_id, content_hash, jurisdiction, mode)
+);
+
+CREATE INDEX IF NOT EXISTS idx_intake_cache_lookup
+    ON intake_analysis_cache (user_id, content_hash, jurisdiction, mode)
+    WHERE expires_at > NOW();
+
 CREATE TABLE IF NOT EXISTS gdpr_checks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id),

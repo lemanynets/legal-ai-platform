@@ -419,7 +419,23 @@ export default function AnalyzePage() {
             }}
           >
             <div>
-              <h2 style={{ fontSize: "22px", marginBottom: "6px" }}>Результат intake-аналізу</h2>
+              <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "6px" }}>
+                <h2 style={{ fontSize: "22px", margin: 0 }}>Результат intake-аналізу</h2>
+                {intakeResult.cache_hit && (
+                  <span style={{
+                    fontSize: "10px",
+                    fontWeight: 800,
+                    padding: "3px 10px",
+                    borderRadius: "999px",
+                    background: "rgba(16,185,129,0.12)",
+                    color: "var(--success)",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.5px",
+                  }}>
+                    cached
+                  </span>
+                )}
+              </div>
               <p style={{ color: "var(--text-secondary)" }}>
                 Це ядро для наступних етапів: судова практика {"->"} стратегія {"->"} генерація.
               </p>
