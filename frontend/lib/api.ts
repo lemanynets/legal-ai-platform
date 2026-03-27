@@ -1982,6 +1982,12 @@ type ApiClientErrorInit = {
   detail?: string;
   raw?: string;
   isNetwork?: boolean;
+  /** Machine-readable error code from backend (e.g. "INPUT_MISSING_REQUIRED_FIELDS") */
+  code?: string;
+  /** Structured list of blockers returned by the backend */
+  blockers?: import("./error-codes").BlockerItem[];
+  /** Missing required field names (INPUT_MISSING_REQUIRED_FIELDS) */
+  missingFields?: string[];
 };
 
 class ApiClientError extends Error {
@@ -1989,6 +1995,9 @@ class ApiClientError extends Error {
   detail?: string;
   raw?: string;
   isNetwork: boolean;
+  code?: string;
+  blockers?: import("./error-codes").BlockerItem[];
+  missingFields?: string[];
 
   constructor(message: string, init: ApiClientErrorInit = {}) {
     super(message);
@@ -1997,6 +2006,9 @@ class ApiClientError extends Error {
     this.detail = init.detail;
     this.raw = init.raw;
     this.isNetwork = Boolean(init.isNetwork);
+    this.code = init.code;
+    this.blockers = init.blockers;
+    this.missingFields = init.missingFields;
   }
 
   override toString(): string {
@@ -2110,23 +2122,71 @@ function buildHeaders(token?: string, demoUser?: string): HeadersInit {
 async function buildApiError(response: Response): Promise<Error> {
   const text = await response.text();
   let detail = "";
+  let code: string | undefined;
+  let blockers: import("./error-codes").BlockerItem[] | undefined;
+  let missingFields: string[] | undefined;
 
   try {
-    const payload = JSON.parse(text) as { detail?: unknown };
-    if (payload && "detail" in payload) {
-      detail = stringifyDetail(payload.detail);
+    const payload = JSON.parse(text) as {
+      detail?: unknown;
+      error_code?: string;
+      missing_fields?: string[];
+      blockers?: import("./error-codes").BlockerItem[];
+    };
+
+    if (payload) {
+      // Structured error at top level (custom backend format)
+      if (typeof payload.error_code === "string") {
+        code = payload.error_code;
+      }
+      if (Array.isArray(payload.missing_fields)) {
+        missingFields = payload.missing_fields as string[];
+      }
+      if (Array.isArray(payload.blockers)) {
+        blockers = payload.blockers as import("./error-codes").BlockerItem[];
+      }
+
+      // FastAPI standard: detail can be string or structured object
+      if ("detail" in payload) {
+        const d = payload.detail;
+        if (d && typeof d === "object" && !Array.isArray(d)) {
+          const structured = d as {
+            error_code?: string;
+            message?: string;
+            missing_fields?: string[];
+            blockers?: import("./error-codes").BlockerItem[];
+          };
+          if (typeof structured.error_code === "string") code = structured.error_code;
+          if (Array.isArray(structured.missing_fields)) missingFields = structured.missing_fields as string[];
+          if (Array.isArray(structured.blockers)) blockers = structured.blockers as import("./error-codes").BlockerItem[];
+          detail = structured.message ?? stringifyDetail(d);
+        } else {
+          detail = stringifyDetail(d);
+        }
+      }
     }
   } catch {
     // Non-JSON response body, fallback to raw text.
   }
 
-  const message = localizeApiMessage({
+  // Resolve user-facing message: code-based first, then localizeApiMessage fallback
+  const { resolveErrorMessage } = await import("./error-codes");
+  const codedMessage = code ? resolveErrorMessage(code, "") : "";
+  const message = codedMessage || localizeApiMessage({
     status: response.status,
     detail,
     raw: text,
     isNetwork: false,
   });
-  return new ApiClientError(message, { status: response.status, detail, raw: text });
+
+  return new ApiClientError(message, {
+    status: response.status,
+    detail,
+    raw: text,
+    code,
+    blockers,
+    missingFields,
+  });
 }
 
 function buildNetworkError(error: unknown): Error {

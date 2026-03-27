@@ -1,0 +1,138 @@
+# Required input fields per document type.
+# Used by input_gates.py (Wave 0, STORY-0A).
+#
+# Each entry:
+#   <doc_type>:
+#     fields:
+#       - key: <form_data key>
+#         label: <Ukrainian label shown to user>
+#     court_required: <bool>  # additional court field gate
+#     parties_required: <bool>
+
+pozov_do_sudu:
+  fields:
+    - key: plaintiff_name
+      label: "Позивач (ПІБ або назва)"
+    - key: defendant_name
+      label: "Відповідач (ПІБ або назва)"
+    - key: claim_amount
+      label: "Ціна позову"
+    - key: claim_description
+      label: "Суть позову"
+  court_required: true
+  parties_required: true
+
+pozov_trudovyi:
+  fields:
+    - key: plaintiff_name
+      label: "Позивач (ПІБ)"
+    - key: defendant_name
+      label: "Роботодавець"
+    - key: dismissal_date
+      label: "Дата звільнення"
+    - key: claim_description
+      label: "Суть трудового спору"
+  court_required: true
+  parties_required: true
+
+zaява_do_sudu:
+  fields:
+    - key: applicant_name
+      label: "Заявник (ПІБ або назва)"
+    - key: request_description
+      label: "Суть заяви"
+  court_required: true
+  parties_required: false
+
+skarha_administratyvna:
+  fields:
+    - key: plaintiff_name
+      label: "Скаржник (ПІБ або назва)"
+    - key: defendant_name
+      label: "Суб'єкт владних повноважень"
+    - key: claim_description
+      label: "Суть скарги"
+  court_required: true
+  parties_required: true
+
+dohovir_kupivli_prodazhu:
+  fields:
+    - key: seller_name
+      label: "Продавець"
+    - key: buyer_name
+      label: "Покупець"
+    - key: subject_description
+      label: "Предмет договору"
+    - key: price
+      label: "Ціна"
+  court_required: false
+  parties_required: true
+
+dohovir_orendi:
+  fields:
+    - key: landlord_name
+      label: "Орендодавець"
+    - key: tenant_name
+      label: "Орендар"
+    - key: property_description
+      label: "Об'єкт оренди"
+    - key: rent_amount
+      label: "Орендна плата"
+    - key: lease_start
+      label: "Дата початку оренди"
+  court_required: false
+  parties_required: true
+
+dohovir_nadannia_posluh:
+  fields:
+    - key: provider_name
+      label: "Виконавець"
+    - key: client_name
+      label: "Замовник"
+    - key: service_description
+      label: "Перелік послуг"
+    - key: price
+      label: "Вартість послуг"
+  court_required: false
+  parties_required: true
+
+pretenziya:
+  fields:
+    - key: sender_name
+      label: "Відправник (ПІБ або назва)"
+    - key: recipient_name
+      label: "Отримувач"
+    - key: claim_description
+      label: "Суть претензії"
+    - key: demand_amount
+      label: "Сума вимоги"
+  court_required: false
+  parties_required: true
+
+dovirennist:
+  fields:
+    - key: principal_name
+      label: "Довіритель (ПІБ)"
+    - key: agent_name
+      label: "Представник (ПІБ)"
+    - key: authority_description
+      label: "Обсяг повноважень"
+  court_required: false
+  parties_required: true
+
+zayava_pro_vidsutnost:
+  fields:
+    - key: applicant_name
+      label: "Заявник (ПІБ)"
+    - key: request_description
+      label: "Підстава заяви"
+  court_required: false
+  parties_required: false
+
+# Fallback: applied to any doc_type not listed above
+_default:
+  fields:
+    - key: description
+      label: "Опис документа"
+  court_required: false
+  parties_required: false

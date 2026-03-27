@@ -33,6 +33,7 @@ import {
   updateUserPreferences,
   type UserPreferences,
 } from "@/lib/api";
+import { type BlockerItem } from "@/lib/error-codes";
 
 type RawFormData = Record<string, string>;
 
@@ -96,6 +97,8 @@ export default function GeneratePage() {
   const [schemaLoading, setSchemaLoading] = useState(false);
   const [savedDigestLoading, setSavedDigestLoading] = useState(false);
   const [error, setError] = useState("");
+  const [blockers, setBlockers] = useState<BlockerItem[]>([]);
+  const [missingFields, setMissingFields] = useState<string[]>([]);
   const [info, setInfo] = useState("");
   const [result, setResult] = useState<GenerateResponse | GenerateBundleResponse | null>(null);
   const [genMode, setGenMode] = useState<"standard" | "deep">("standard");
@@ -415,6 +418,8 @@ export default function GeneratePage() {
     setResult(null);
     setIsSavedToKb(false);
     setError("");
+    setBlockers([]);
+    setMissingFields([]);
     setInfo("");
     setGenProgress("");
 
@@ -448,7 +453,24 @@ export default function GeneratePage() {
           getUserId()
         );
       })
-      .catch((nextError) => setError(String(nextError)))
+      .catch((nextError: unknown) => {
+        // Extract structured blocker/missing-fields data from 422 responses
+        if (
+          nextError &&
+          typeof nextError === "object" &&
+          "code" in nextError
+        ) {
+          const apiErr = nextError as {
+            code?: string;
+            blockers?: BlockerItem[];
+            missingFields?: string[];
+            message?: string;
+          };
+          if (apiErr.blockers?.length) setBlockers(apiErr.blockers);
+          if (apiErr.missingFields?.length) setMissingFields(apiErr.missingFields);
+        }
+        setError(nextError instanceof Error ? nextError.message : String(nextError));
+      })
       .finally(() => setLoading(false));
   }
 
@@ -490,6 +512,42 @@ export default function GeneratePage() {
       )}
 
       {error && <div className="alert alert-error">Помилка: {error}</div>}
+
+      {/* Structured missing-fields block (INPUT_MISSING_REQUIRED_FIELDS) */}
+      {missingFields.length > 0 && (
+        <div className="card-elevated" style={{ padding: "14px 18px", borderLeft: "3px solid var(--danger)", background: "rgba(239,68,68,0.06)" }}>
+          <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--danger)", marginBottom: "8px" }}>
+            Обов'язкові поля не заповнені
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+            {missingFields.map((f) => (
+              <span key={f} style={{ padding: "3px 10px", borderRadius: "999px", fontSize: "12px", fontWeight: 600, background: "rgba(239,68,68,0.12)", color: "var(--danger)" }}>
+                {f}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Structured processual blockers block (PROC_BLOCKER) */}
+      {blockers.length > 0 && (
+        <div className="card-elevated" style={{ padding: "14px 18px", borderLeft: "3px solid var(--danger)", background: "rgba(239,68,68,0.06)" }}>
+          <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--danger)", marginBottom: "8px" }}>
+            Процесуальні блокери — генерація неможлива
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+            {blockers.map((b, i) => (
+              <div key={i} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
+                <span style={{ padding: "2px 8px", borderRadius: "6px", fontSize: "11px", fontWeight: 700, background: "rgba(239,68,68,0.18)", color: "var(--danger)", flexShrink: 0 }}>
+                  {b.code}
+                </span>
+                <span style={{ color: "var(--text-secondary)" }}>{b.message}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {selectedCaseDetail && (
         <div className="card-elevated" style={{ padding: "16px 18px", border: "1px solid rgba(96,165,250,0.18)", background: "rgba(96,165,250,0.06)" }}>
           <div style={{ fontSize: "12px", color: "#93c5fd", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: "6px" }}>Контекст справи</div>
