@@ -4297,3 +4297,58 @@ export async function createStrategyBlueprintStream(
     throw err;
   }
 }
+
+// ---------------------------------------------------------------------------
+// User Preferences (smart defaults)
+// ---------------------------------------------------------------------------
+
+export type UserPreferences = {
+  gen_mode?: "standard" | "deep";
+  gen_style?: "persuasive" | "aggressive" | "conciliatory" | "analytical";
+  target_language?: TargetLanguage;
+  include_digest?: boolean;
+  default_doc_type?: string;
+  case_law_only_supreme?: boolean;
+  case_law_court_type?: string;
+  case_law_source?: string;
+};
+
+/**
+ * Fetch the current user's saved preferences.
+ * Returns an empty object if the endpoint is unavailable (404) or on network error,
+ * so callers can safely fall back to local defaults without blocking.
+ */
+export async function getUserPreferences(
+  token?: string,
+  demoUser?: string
+): Promise<UserPreferences> {
+  try {
+    return await request<UserPreferences>("/api/users/me/preferences", {
+      token,
+      demoUser,
+    });
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Persist user preferences on the server. Merges with existing prefs (PATCH semantics).
+ * Silently ignores failures so the UI never breaks.
+ */
+export async function updateUserPreferences(
+  prefs: Partial<UserPreferences>,
+  token?: string,
+  demoUser?: string
+): Promise<UserPreferences> {
+  try {
+    return await request<UserPreferences>("/api/users/me/preferences", {
+      method: "PATCH",
+      body: prefs,
+      token,
+      demoUser,
+    });
+  } catch {
+    return prefs as UserPreferences;
+  }
+}

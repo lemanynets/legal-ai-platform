@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
 import { getSession, getToken, getUserId } from "@/lib/auth";
@@ -29,6 +29,9 @@ import {
   type KnowledgeEntry,
   searchCaseLaw,
   createKnowledgeEntry,
+  getUserPreferences,
+  updateUserPreferences,
+  type UserPreferences,
 } from "@/lib/api";
 
 type RawFormData = Record<string, string>;
@@ -110,6 +113,7 @@ export default function GeneratePage() {
   const [savingToKb, setSavingToKb] = useState(false);
   const [isSavedToKb, setIsSavedToKb] = useState(false);
   const [genProgress, setGenProgress] = useState("");
+  const prefsApplied = useRef(false);
 
   // Bundle states
   const [isBundleMode, setIsBundleMode] = useState(false);
@@ -232,6 +236,17 @@ export default function GeneratePage() {
       .then(setKnowledgeBase)
       .catch(() => setKnowledgeBase([]))
       .finally(() => setKbLoading(false));
+
+    // Load server-backed preferences (non-blocking)
+    getUserPreferences(getToken(), getUserId()).then((prefs) => {
+      if (prefsApplied.current) return;
+      prefsApplied.current = true;
+      if (prefs.gen_mode) setGenMode(prefs.gen_mode);
+      if (prefs.gen_style) setGenStyle(prefs.gen_style);
+      if (prefs.target_language) setTargetLanguage(prefs.target_language);
+      if (typeof prefs.include_digest === "boolean") setIncludeDigest(prefs.include_digest);
+      if (prefs.default_doc_type) setSelectedDocType(prefs.default_doc_type);
+    });
   }, [searchParams]);
 
   useEffect(() => {
@@ -420,6 +435,18 @@ export default function GeneratePage() {
         } else {
           setInfo(`Документ згенеровано: ${data.title}.`);
         }
+        // Persist current settings as user preferences (fire-and-forget)
+        updateUserPreferences(
+          {
+            gen_mode: genMode,
+            gen_style: genStyle,
+            target_language: targetLanguage,
+            include_digest: includeDigest,
+            default_doc_type: selectedDocType,
+          },
+          getToken(),
+          getUserId()
+        );
       })
       .catch((nextError) => setError(String(nextError)))
       .finally(() => setLoading(false));

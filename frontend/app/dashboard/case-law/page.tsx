@@ -18,6 +18,8 @@ import {
   importCaseLaw,
   searchCaseLaw,
   syncCaseLaw,
+  getUserPreferences,
+  updateUserPreferences,
 } from "@/lib/api";
 
 const PROMPT_STORAGE_KEY = "legal_ai_prompt_context";
@@ -173,6 +175,12 @@ export default function CaseLawPage() {
     } catch {
       // no-op
     }
+    // Overlay server-backed preferences (non-blocking)
+    getUserPreferences(getToken(), getUserId()).then((prefs) => {
+      if (prefs.case_law_only_supreme !== undefined) setOnlySupreme(prefs.case_law_only_supreme);
+      if (prefs.case_law_court_type) setCourtType(prefs.case_law_court_type);
+      if (prefs.case_law_source) setSource(prefs.case_law_source);
+    });
     void refreshEntitlements();
   }, []);
 
@@ -287,6 +295,16 @@ export default function CaseLawPage() {
       setSortBy(result.sort_by as keyof CaseLawSearchItem);
       setSortDir(result.sort_dir);
       setInfo(`Знайдено ${result.total} рішень. Сторінка ${result.page}/${result.pages}.`);
+      // Persist case-law preferences server-side (fire-and-forget)
+      updateUserPreferences(
+        {
+          case_law_only_supreme: onlySupreme,
+          case_law_court_type: courtType || undefined,
+          case_law_source: source || undefined,
+        },
+        getToken(),
+        getUserId()
+      );
     } catch (nextError) {
       setError(formatError(nextError));
     } finally {
