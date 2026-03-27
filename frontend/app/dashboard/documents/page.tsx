@@ -9,11 +9,16 @@ import {
   exportDocument,
   getDocumentDetail,
   getDocumentsHistory,
+  getDocumentVersions,
+  getDocumentVersionDiff,
+  restoreDocumentVersion,
   updateDocument,
   getCases,
   submitToECourt,
   getECourtCourts,
   type DocumentsHistoryResponse,
+  type DocumentVersionItem,
+  type DocumentVersionDiffResponse,
   type Case
 } from "@/lib/api";
 
@@ -49,6 +54,15 @@ export default function DocumentsHistoryPage() {
   const [selectedCourt, setSelectedCourt] = useState("");
   const [signerMethod, setSignerMethod] = useState<"file_key" | "hardware_token" | "remote_id">("file_key");
   const [submissionNote, setSubmissionNote] = useState("");
+
+  // Version history state
+  const [versionDocId, setVersionDocId] = useState<string | null>(null);
+  const [versionDocTitle, setVersionDocTitle] = useState("");
+  const [versions, setVersions] = useState<DocumentVersionItem[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionDiff, setVersionDiff] = useState<DocumentVersionDiffResponse | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
 
   useEffect(() => {
     loadHistory(1);
@@ -177,6 +191,52 @@ export default function DocumentsHistoryPage() {
     }
   }
 
+  async function onOpenVersions(documentId: string, title: string): Promise<void> {
+    setVersionDocId(documentId);
+    setVersionDocTitle(title);
+    setVersionDiff(null);
+    setVersionsLoading(true);
+    try {
+      const data = await getDocumentVersions(documentId, 1, 50, getToken(), getUserId());
+      setVersions(data.items);
+    } catch {
+      setError("Не вдалося завантажити історію версій.");
+      setVersionDocId(null);
+    } finally {
+      setVersionsLoading(false);
+    }
+  }
+
+  async function onViewDiff(versionId: string): Promise<void> {
+    if (!versionDocId) return;
+    setDiffLoading(true);
+    setVersionDiff(null);
+    try {
+      const diff = await getDocumentVersionDiff(versionDocId, versionId, "current", getToken(), getUserId());
+      setVersionDiff(diff);
+    } catch {
+      setError("Не вдалося завантажити diff.");
+    } finally {
+      setDiffLoading(false);
+    }
+  }
+
+  async function onRestore(versionId: string, versionNumber: number): Promise<void> {
+    if (!versionDocId) return;
+    if (!confirm(`Відновити документ до версії #${versionNumber}? Поточна версія буде збережена в історії.`)) return;
+    setRestoring(true);
+    try {
+      await restoreDocumentVersion(versionDocId, versionId, getToken(), getUserId());
+      setVersionDocId(null);
+      setVersionDiff(null);
+      await loadHistory(history?.page ?? 1);
+    } catch {
+      setError("Не вдалося відновити версію.");
+    } finally {
+      setRestoring(false);
+    }
+  }
+
   async function onFinalSubmitToECourt(): Promise<void> {
     if (!submittingId || !selectedCourt) return;
     setSaving(true);
@@ -290,6 +350,7 @@ export default function DocumentsHistoryPage() {
                   </div>
                   <div className="action-utility-buttons">
                     <button onClick={() => onEditStart(doc.id)} className="btn-icon-link" title="Редагувати">✎</button>
+                    <button onClick={() => onOpenVersions(doc.id, doc.title)} className="btn-icon-link" title="Історія версій" style={{ color: 'var(--accent)' }}>⏱</button>
                     <button onClick={() => onClone(doc.id)} className="btn-icon-link" title="Копіювати">📋</button>
                     <button onClick={() => onOpenSubmitModal(doc.id)} className="btn-icon-link" title="Подати в Е-Суд" style={{ color: 'var(--gold-400)' }}>🏛</button>
                     <button onClick={() => onDelete(doc.id)} className="btn-icon-link danger" title="Видалити">🗑</button>
@@ -420,6 +481,137 @@ export default function DocumentsHistoryPage() {
               >
                 {saving ? "Подаємо..." : "Підтвердити подачу"}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {versionDocId && (
+        <div className="modal-overlay-blur">
+          <div className="modal-content-luxury card-elevated" style={{ animation: 'fadeIn 0.3s ease-out', maxWidth: '1000px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+              <div>
+                <h2 style={{ fontSize: '20px', fontWeight: 800, margin: 0 }}>Історія версій</h2>
+                <p style={{ fontSize: '13px', color: 'var(--text-muted)', marginTop: '4px' }}>{versionDocTitle}</p>
+              </div>
+              <button
+                className="btn btn-secondary"
+                style={{ borderRadius: '50%', width: 40, height: 40, padding: 0 }}
+                onClick={() => { setVersionDocId(null); setVersionDiff(null); }}
+              >
+                &times;
+              </button>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: versionDiff ? '320px 1fr' : '1fr', gap: '20px' }}>
+              {/* Version list */}
+              <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
+                {versionsLoading ? (
+                  <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                    Завантаження...
+                  </div>
+                ) : versions.length === 0 ? (
+                  <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                    Цей документ ще не має збережених версій.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {versions.map((v) => (
+                      <div
+                        key={v.id}
+                        style={{
+                          padding: '14px 16px',
+                          borderRadius: '14px',
+                          background: versionDiff?.target_version_id === v.id ? 'rgba(59, 130, 246, 0.1)' : 'rgba(255,255,255,0.03)',
+                          border: versionDiff?.target_version_id === v.id ? '1px solid rgba(59, 130, 246, 0.3)' : '1px solid rgba(255,255,255,0.05)',
+                          transition: 'all 0.2s',
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span style={{
+                              background: 'rgba(212,168,67,0.15)',
+                              color: 'var(--gold-400)',
+                              fontSize: '11px',
+                              fontWeight: 800,
+                              padding: '2px 8px',
+                              borderRadius: '6px',
+                            }}>
+                              v{v.version_number}
+                            </span>
+                            <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{v.action}</span>
+                          </div>
+                          <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>
+                            {new Date(v.created_at).toLocaleString('uk-UA')}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                          <button
+                            className="btn btn-secondary"
+                            style={{ fontSize: '11px', padding: '4px 10px', borderRadius: '8px' }}
+                            onClick={() => onViewDiff(v.id)}
+                            disabled={diffLoading}
+                          >
+                            {diffLoading && versionDiff === null ? '...' : 'Diff'}
+                          </button>
+                          <button
+                            className="btn btn-primary"
+                            style={{ fontSize: '11px', padding: '4px 10px', borderRadius: '8px' }}
+                            onClick={() => onRestore(v.id, v.version_number)}
+                            disabled={restoring}
+                          >
+                            {restoring ? '...' : 'Відновити'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Diff panel */}
+              {versionDiff && (
+                <div style={{
+                  background: 'rgba(0,0,0,0.3)',
+                  borderRadius: '16px',
+                  border: '1px solid rgba(255,255,255,0.06)',
+                  padding: '20px',
+                  maxHeight: '500px',
+                  overflowY: 'auto',
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                    <h3 style={{ fontSize: '14px', fontWeight: 700, margin: 0 }}>
+                      Diff: v{versionDiff.target_version_number} vs {versionDiff.against_version_number ? `v${versionDiff.against_version_number}` : 'поточна'}
+                    </h3>
+                    <div style={{ display: 'flex', gap: '12px', fontSize: '12px' }}>
+                      <span style={{ color: 'var(--success)' }}>+{versionDiff.added_lines}</span>
+                      <span style={{ color: 'var(--danger)' }}>-{versionDiff.removed_lines}</span>
+                    </div>
+                  </div>
+                  <pre style={{
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    fontSize: '12px',
+                    lineHeight: 1.7,
+                    color: 'var(--text-secondary)',
+                    margin: 0,
+                    fontFamily: "'Fira Code', 'Consolas', monospace",
+                  }}>
+                    {versionDiff.diff_text.split('\n').map((line, i) => {
+                      let color = 'var(--text-secondary)';
+                      let bg = 'transparent';
+                      if (line.startsWith('+')) { color = 'var(--success)'; bg = 'rgba(16,185,129,0.08)'; }
+                      else if (line.startsWith('-')) { color = 'var(--danger)'; bg = 'rgba(239,68,68,0.08)'; }
+                      else if (line.startsWith('@@')) { color = 'var(--accent)'; bg = 'rgba(59,130,246,0.06)'; }
+                      return (
+                        <div key={i} style={{ color, background: bg, padding: '1px 6px', borderRadius: '2px' }}>
+                          {line}
+                        </div>
+                      );
+                    })}
+                  </pre>
+                </div>
+              )}
             </div>
           </div>
         </div>
