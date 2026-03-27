@@ -374,6 +374,15 @@ export type ForumComment = {
   created_at: string;
 };
 
+export type AnalysisComment = {
+  id: string;
+  intake_id: string;
+  user_id: string;
+  user_name: string | null;
+  content: string;
+  created_at: string;
+};
+
 export type KnowledgeEntry = {
   id: string;
   user_id: string;
@@ -4367,4 +4376,46 @@ export async function updateUserPreferences(
   } catch {
     return prefs as UserPreferences;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Analysis comments (collaborative review)
+// ---------------------------------------------------------------------------
+
+export async function getAnalysisComments(
+  intakeId: string,
+  token?: string,
+  demoUser?: string
+): Promise<AnalysisComment[]> {
+  return request<AnalysisComment[]>(`/api/analyze/${intakeId}/comments`, {
+    token,
+    demoUser,
+  });
+}
+
+export async function createAnalysisComment(
+  intakeId: string,
+  content: string,
+  token?: string,
+  demoUser?: string
+): Promise<AnalysisComment> {
+  return request<AnalysisComment>(`/api/analyze/${intakeId}/comments`, {
+    method: "POST",
+    body: { content },
+    token,
+    demoUser,
+  });
+}
+
+export async function deleteAnalysisComment(
+  intakeId: string,
+  commentId: string,
+  token?: string,
+  demoUser?: string
+): Promise<void> {
+  await request<void>(`/api/analyze/${intakeId}/comments/${commentId}`, {
+    method: "DELETE",
+    token,
+    demoUser,
+  });
 }

@@ -9,6 +9,7 @@ import {
   analyzeIntakeStream,
   analyzeGdprCompliance,
   createCase,
+  type AnalysisComment,
   type ContractAnalysisHistoryResponse,
   type GdprComplianceResponse,
   type ContractAnalysisItem,
@@ -17,6 +18,9 @@ import {
   getCase,
   getCases,
   getContractAnalysisHistory,
+  getAnalysisComments,
+  createAnalysisComment,
+  deleteAnalysisComment,
   processContractAnalysis,
   type Case,
 } from "@/lib/api";
@@ -76,7 +80,15 @@ export default function AnalyzePage() {
   const [newCaseTitle, setNewCaseTitle] = useState("");
   const [tagFilter, setTagFilter] = useState("");
 
+  // Collaborative comments
+  const [comments, setComments] = useState<AnalysisComment[]>([]);
+  const [commentsLoading, setCommentsLoading] = useState(false);
+  const [commentText, setCommentText] = useState("");
+  const [submittingComment, setSubmittingComment] = useState(false);
+  const [deletingCommentId, setDeletingCommentId] = useState<string | null>(null);
+
   const intakeResult = intakeResults[activeResultIndex] ?? null;
+  const currentUserId = getUserId() ?? "";
 
   useEffect(() => {
     void loadHistory();
@@ -84,6 +96,19 @@ export default function AnalyzePage() {
       .then(setCases)
       .catch((err) => console.error("Failed to load cases:", err));
   }, []);
+
+  // Load comments whenever the active intake result changes
+  useEffect(() => {
+    if (!intakeResult?.id) {
+      setComments([]);
+      return;
+    }
+    setCommentsLoading(true);
+    getAnalysisComments(intakeResult.id, getToken(), getUserId())
+      .then(setComments)
+      .catch(() => setComments([]))
+      .finally(() => setCommentsLoading(false));
+  }, [intakeResult?.id]);
 
   function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
@@ -231,6 +256,40 @@ export default function AnalyzePage() {
     setNewCaseTitle(intakeResult?.classified_type || "");
     setShowCreateCaseModal(true);
   }
+
+  async function handleAddComment(e: React.FormEvent) {
+    e.preventDefault();
+    if (!intakeResult?.id || !commentText.trim()) return;
+    setSubmittingComment(true);
+    try {
+      const newComment = await createAnalysisComment(
+        intakeResult.id,
+        commentText.trim(),
+        getToken(),
+        getUserId()
+      );
+      setComments((prev) => [...prev, newComment]);
+      setCommentText("");
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setSubmittingComment(false);
+    }
+  }
+
+  async function handleDeleteComment(commentId: string) {
+    if (!intakeResult?.id) return;
+    setDeletingCommentId(commentId);
+    try {
+      await deleteAnalysisComment(intakeResult.id, commentId, getToken(), getUserId());
+      setComments((prev) => prev.filter((c) => c.id !== commentId));
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setDeletingCommentId(null);
+    }
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
       <div className="section-header">
@@ -753,6 +812,109 @@ export default function AnalyzePage() {
               )}
             </div>
           </div>
+
+          {/* ── Collaborative comments ── */}
+          <div style={{ marginTop: "28px", borderTop: "1px solid rgba(255,255,255,0.07)", paddingTop: "24px" }}>
+            <h3 style={{ fontSize: "15px", fontWeight: 700, color: "#fff", marginBottom: "14px" }}>
+              Коментарі до аналізу
+              {commentsLoading && <span className="spinner" style={{ width: 12, height: 12, marginLeft: 8 }} />}
+              {!commentsLoading && (
+                <span style={{ fontSize: "12px", fontWeight: 400, color: "var(--text-muted)", marginLeft: "8px" }}>
+                  {comments.length}
+                </span>
+              )}
+            </h3>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginBottom: "16px" }}>
+              {comments.length === 0 && !commentsLoading && (
+                <p style={{ fontSize: "13px", color: "var(--text-muted)" }}>
+                  Коментарів поки немає. Будьте першим.
+                </p>
+              )}
+              {comments.map((c) => (
+                <div
+                  key={c.id}
+                  style={{
+                    padding: "12px 14px",
+                    borderRadius: "12px",
+                    background: c.user_id === currentUserId
+                      ? "rgba(212,168,67,0.06)"
+                      : "rgba(255,255,255,0.03)",
+                    border: `1px solid ${c.user_id === currentUserId ? "rgba(212,168,67,0.15)" : "rgba(255,255,255,0.06)"}`,
+                    display: "flex",
+                    gap: "10px",
+                    alignItems: "flex-start",
+                  }}
+                >
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "5px" }}>
+                      <span style={{ fontSize: "12px", fontWeight: 700, color: c.user_id === currentUserId ? "var(--gold-400)" : "var(--text-secondary)" }}>
+                        {c.user_id === currentUserId ? "Ви" : (c.user_name || "Колега")}
+                      </span>
+                      <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                        {new Date(c.created_at).toLocaleString("uk-UA", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}
+                      </span>
+                    </div>
+                    <p style={{ fontSize: "13px", color: "var(--text-secondary)", margin: 0, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>
+                      {c.content}
+                    </p>
+                  </div>
+                  {c.user_id === currentUserId && (
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteComment(c.id)}
+                      disabled={deletingCommentId === c.id}
+                      style={{
+                        background: "none",
+                        border: "none",
+                        cursor: "pointer",
+                        color: "var(--text-muted)",
+                        fontSize: "16px",
+                        padding: "2px 4px",
+                        lineHeight: 1,
+                        flexShrink: 0,
+                      }}
+                      title="Видалити коментар"
+                    >
+                      {deletingCommentId === c.id ? <span className="spinner" style={{ width: 12, height: 12 }} /> : "×"}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <form onSubmit={(e) => void handleAddComment(e)} style={{ display: "flex", gap: "8px", alignItems: "flex-end" }}>
+              <textarea
+                value={commentText}
+                onChange={(e) => setCommentText(e.target.value)}
+                placeholder="Напишіть коментар до аналізу..."
+                rows={2}
+                maxLength={4000}
+                style={{
+                  flex: 1,
+                  resize: "vertical",
+                  minHeight: "60px",
+                  padding: "10px 14px",
+                  borderRadius: "12px",
+                  background: "rgba(255,255,255,0.04)",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  color: "#fff",
+                  fontSize: "13px",
+                  lineHeight: 1.5,
+                  fontFamily: "inherit",
+                }}
+              />
+              <button
+                type="submit"
+                className="btn btn-primary btn-sm"
+                disabled={submittingComment || !commentText.trim()}
+                style={{ padding: "10px 18px", alignSelf: "flex-end", whiteSpace: "nowrap" }}
+              >
+                {submittingComment ? <span className="spinner" style={{ width: 12, height: 12 }} /> : "Надіслати"}
+              </button>
+            </form>
+          </div>
+          {/* ── /Collaborative comments ── */}
         </section>
       )}
 

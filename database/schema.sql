@@ -131,3 +131,15 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     prefs JSONB NOT NULL DEFAULT '{}'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS analysis_comments (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    intake_id  UUID NOT NULL,
+    user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+    user_name  TEXT,
+    content    TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_comments_intake
+    ON analysis_comments (intake_id, created_at);

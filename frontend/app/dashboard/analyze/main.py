@@ -31,10 +31,12 @@ from .intake import router as intake_router
 from .document_signed_url import router as signed_url_router
 from .user_preferences import router as prefs_router
 from .batch import router as batch_router
+from .comments import router as comments_router
 
 app.include_router(cases_router, prefix="/api/cases", tags=["cases"])
 app.include_router(gdpr_router, prefix="/api/analyze", tags=["gdpr"])
 app.include_router(intake_router, prefix="/api/analyze", tags=["intake"])
 app.include_router(batch_router, prefix="/api/analyze", tags=["intake"])
+app.include_router(comments_router, prefix="/api/analyze", tags=["comments"])
 app.include_router(signed_url_router, prefix="/api/documents", tags=["documents"])
 app.include_router(prefs_router, prefix="/api/users", tags=["users"])
