@@ -1960,6 +1960,12 @@ type RequestOptions = {
   body?: unknown;
   token?: string;
   demoUser?: string;
+  /**
+   * Browser fetch cache mode. Defaults to "no-store" so user-specific and
+   * mutable responses are never served from cache. Pass "default" for
+   * genuinely static/public endpoints to honour server Cache-Control headers.
+   */
+  cache?: RequestCache;
 };
 
 type ApiClientErrorInit = {
@@ -2139,7 +2145,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     method: options.method ?? "GET",
     headers: buildHeaders(options.token, options.demoUser),
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    cache: "no-store"
+    cache: options.cache ?? "no-store",
   });
 
   if (!response.ok) {
@@ -2247,12 +2253,19 @@ async function streamRequest<T>(
 }
 
 export async function getDocumentTypes(): Promise<DocumentType[]> {
-  const data = await request<{ items: DocumentType[] }>("/api/documents/types");
+  // Static public list — honour server Cache-Control headers (e.g. max-age=3600).
+  const data = await request<{ items: DocumentType[] }>("/api/documents/types", {
+    cache: "default",
+  });
   return data.items;
 }
 
 export async function getDocumentFormSchema(docType: string): Promise<FormField[]> {
-  const data = await request<{ doc_type: string; schema: FormField[] }>(`/api/documents/form/${docType}`);
+  // Form schemas rarely change — honour server Cache-Control headers.
+  const data = await request<{ doc_type: string; schema: FormField[] }>(
+    `/api/documents/form/${docType}`,
+    { cache: "default" }
+  );
   return data.schema;
 }
 
@@ -2651,7 +2664,10 @@ export async function generateDocument(
 }
 
 export async function getBillingPlans(): Promise<BillingPlan[]> {
-  const data = await request<{ items: BillingPlan[] }>("/api/billing/plans");
+  // Public pricing data — honour server Cache-Control headers.
+  const data = await request<{ items: BillingPlan[] }>("/api/billing/plans", {
+    cache: "default",
+  });
   return data.items;
 }
 
