@@ -7,7 +7,7 @@ import { getToken, getUserId } from "@/lib/auth";
 import {
   autoProcessFullLawyer,
   autoProcessFullLawyerPreflight,
-  exportDocument,
+  downloadDocument,
   exportFullLawyerPreflightReport,
   getCase,
   getCases,
@@ -323,9 +323,7 @@ export default function FullLawyerPage() {
   async function onDownloadDocument(documentId: string, format: "pdf" | "docx"): Promise<void> {
     const key = `${documentId}:${format}`; setDownloadingKey(key); setError("");
     try {
-      const blob = await exportDocument(documentId, format, false, getToken(), getUserId());
-      const url = URL.createObjectURL(blob); const a = document.createElement("a");
-      a.href = url; a.download = `${documentId}.${format}`; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      await downloadDocument(documentId, format, getToken(), getUserId());
     } catch (err) { setError(String(err)); } finally { setDownloadingKey(null); }
   }
 

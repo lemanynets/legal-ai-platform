@@ -3222,6 +3222,64 @@ export async function exportDocument(
   return response.blob();
 }
 
+export type SignedUrlResponse = {
+  url: string;
+  expires_at: string;
+  format: "docx" | "pdf";
+  document_id: string;
+};
+
+/**
+ * Retrieve a time-limited signed URL for direct document download.
+ * Falls back to the legacy blob-proxy export if the endpoint is unavailable.
+ */
+export async function getDocumentSignedUrl(
+  documentId: string,
+  format: "docx" | "pdf",
+  token?: string,
+  demoUser?: string
+): Promise<SignedUrlResponse> {
+  return request<SignedUrlResponse>(
+    `/api/documents/${documentId}/signed-url?format=${format}`,
+    { token, demoUser }
+  );
+}
+
+/**
+ * Download a document via signed URL (preferred) with automatic fallback
+ * to the legacy blob-proxy export when the signed-url endpoint is not
+ * available (404) or fails.
+ */
+export async function downloadDocument(
+  documentId: string,
+  format: "docx" | "pdf",
+  token?: string,
+  demoUser?: string
+): Promise<void> {
+  try {
+    const { url } = await getDocumentSignedUrl(documentId, format, token, demoUser);
+    // Open signed URL directly — no auth header needed, the URL is self-authenticating
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `document-${documentId}.${format}`;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } catch {
+    // Fallback: legacy blob-proxy export
+    const blob = await exportDocument(documentId, format, false, token, demoUser);
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = `document-${documentId}.${format}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(blobUrl);
+  }
+}
+
 export async function searchCaseLaw(
   params: {
     query?: string;

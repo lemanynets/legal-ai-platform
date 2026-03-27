@@ -6,7 +6,7 @@ import {
   bulkDeleteDocuments,
   cloneDocument,
   deleteDocument,
-  exportDocument,
+  downloadDocument,
   getDocumentDetail,
   getDocumentsHistory,
   getDocumentVersions,
@@ -109,15 +109,7 @@ export default function DocumentsHistoryPage() {
   async function onExport(documentId: string, format: "docx" | "pdf"): Promise<void> {
     setActionLoadingId(`${documentId}-${format}`);
     try {
-      const blob = await exportDocument(documentId, format, false, getToken(), getUserId());
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `document-${documentId}.${format}`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      await downloadDocument(documentId, format, getToken(), getUserId());
     } catch (err) {
       setError("Помилка при експорті документа.");
     } finally {
