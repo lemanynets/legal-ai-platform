@@ -191,7 +191,7 @@ export default function AnalyzePage() {
     setError("");
     setGdprResult(null);
     try {
-      const result = await analyzeGdprCompliance({ text: intakeResult.raw_text_preview }, getToken(), getUserId());
+      const result = await analyzeGdprCompliance({ text: intakeResult.raw_text_preview, intake_id: intakeResult.id }, getToken(), getUserId());
       setGdprResult(result.report);
     } catch (err) {
       setError(String(err));

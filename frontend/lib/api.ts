@@ -3626,29 +3626,33 @@ export type JudgeSimulationResponse = {
 
 export type GdprComplianceResponse = {
   report: string;
-  compliant?: boolean;
-  issues?: string[];
+  compliant: boolean;
+  issues: string[];
+  personal_data_found?: { type: string; count: number; examples?: string[] }[];
+  recommendations?: string[];
 };
 
 export async function analyzeGdprCompliance(
-  payload: { text: string },
+  payload: { text: string; intake_id?: string },
   token?: string,
   demoUser?: string
 ): Promise<GdprComplianceResponse> {
-  void token;
-  void demoUser;
-
   const text = String(payload.text || "").trim();
   if (!text) {
     throw new Error("Немає тексту для GDPR-перевірки.");
   }
 
-  return {
-    report:
-      "GDPR-модуль ще не підключений до backend. Основний intake-аналіз працює, але окрема GDPR-перевірка поки недоступна.",
-    compliant: false,
-    issues: ["gdpr_module_not_connected"],
-  };
+  const body: Record<string, string> = { text };
+  if (payload.intake_id) {
+    body.intake_id = payload.intake_id;
+  }
+
+  return request<GdprComplianceResponse>("/api/analyze/gdpr-check", {
+    method: "POST",
+    token,
+    demoUser,
+    body,
+  });
 }
 
 export async function analyzeIntake(
