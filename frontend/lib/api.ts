@@ -2513,6 +2513,8 @@ export async function exportDocumentsHistory(
   return response.blob();
 }
 
+export type TargetLanguage = "uk" | "en" | "pl" | "de";
+
 export async function generateDocument(
   docType: string,
   formData: Record<string, unknown>,
@@ -2533,6 +2535,7 @@ export async function generateDocument(
     style?: string;
     precedent_ids?: string[];
     bundle_doc_types?: string[];
+    target_language?: TargetLanguage;
   }
 ): Promise<GenerateResponse | GenerateBundleResponse> {
   return request<GenerateResponse | GenerateBundleResponse>("/api/documents/generate", {
@@ -3778,6 +3781,7 @@ export async function generateWithStrategy(
     bundle_doc_types?: string[];
     form_data?: Record<string, unknown>;
     extra_prompt_context?: string;
+    target_language?: TargetLanguage;
   },
   token?: string,
   demoUser?: string

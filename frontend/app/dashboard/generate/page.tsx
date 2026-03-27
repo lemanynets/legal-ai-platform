@@ -13,6 +13,7 @@ import {
   type FormField,
   type GenerateResponse,
   type GenerateBundleResponse,
+  type TargetLanguage,
   generateDocument,
   getCase,
   getCaseLawDigest,
@@ -100,6 +101,7 @@ export default function GeneratePage() {
   
   // New State for Style and Precedents
   const [genStyle, setGenStyle] = useState<"persuasive" | "aggressive" | "conciliatory" | "analytical">("persuasive");
+  const [targetLanguage, setTargetLanguage] = useState<TargetLanguage>("uk");
   const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeEntry[]>([]);
   const [selectedPrecedentIds, setSelectedPrecedentIds] = useState<string[]>([]);
   const [kbLoading, setKbLoading] = useState(false);
@@ -388,6 +390,7 @@ export default function GeneratePage() {
       precedent_ids: selectedPrecedentIds.length > 0 ? selectedPrecedentIds : undefined,
       case_id: selectedCaseId || undefined,
       bundle_doc_types: isBundleMode ? bundleDocMapping[selectedBundle] : undefined,
+      target_language: targetLanguage !== "uk" ? targetLanguage : undefined,
     };
 
     setLoading(true);
@@ -505,6 +508,27 @@ export default function GeneratePage() {
                 >
                   <span style={{ marginRight: "6px" }}>{style.icon}</span>
                   {style.label}
+                </button>
+              ))}
+            </div>
+
+            <h3 style={{ fontSize: "16px", marginTop: "20px", marginBottom: "14px", color: "#fff" }}>Мова документа</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+              {([
+                { id: "uk", label: "Українська", flag: "🇺🇦" },
+                { id: "en", label: "English", flag: "🇬🇧" },
+                { id: "pl", label: "Polski", flag: "🇵🇱" },
+                { id: "de", label: "Deutsch", flag: "🇩🇪" },
+              ] as const).map((lang) => (
+                <button
+                  key={lang.id}
+                  type="button"
+                  className={`btn ${targetLanguage === lang.id ? "btn-primary" : "btn-secondary"}`}
+                  style={{ fontSize: "12px", padding: "10px" }}
+                  onClick={() => setTargetLanguage(lang.id)}
+                >
+                  <span style={{ marginRight: "6px" }}>{lang.flag}</span>
+                  {lang.label}
                 </button>
               ))}
             </div>
