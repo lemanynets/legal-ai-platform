@@ -2435,9 +2435,12 @@ export async function getDocumentVersions(
   token?: string,
   demoUser?: string
 ): Promise<DocumentVersionsResponse> {
+  // Version list only grows; existing entries are immutable.
+  // Use "default" so the browser respects Cache-Control headers from the server
+  // (e.g. private, max-age=60). Falls back to network if no headers are set.
   return request<DocumentVersionsResponse>(
     `/api/documents/${documentId}/versions?page=${page}&page_size=${pageSize}`,
-    { token, demoUser }
+    { token, demoUser, cache: "default" }
   );
 }
 
@@ -2447,7 +2450,9 @@ export async function getDocumentVersionDetail(
   token?: string,
   demoUser?: string
 ): Promise<DocumentVersionDetailResponse> {
-  return request<DocumentVersionDetailResponse>(`/api/documents/${documentId}/versions/${versionId}`, { token, demoUser });
+  // Version content is immutable once saved. "default" lets the browser cache it
+  // when the server sends Cache-Control: private, immutable, max-age=86400.
+  return request<DocumentVersionDetailResponse>(`/api/documents/${documentId}/versions/${versionId}`, { token, demoUser, cache: "default" });
 }
 
 export async function getDocumentVersionDiff(
@@ -2458,9 +2463,12 @@ export async function getDocumentVersionDiff(
   demoUser?: string
 ): Promise<DocumentVersionDiffResponse> {
   const encodedAgainst = encodeURIComponent(against);
+  // Diff between two fixed snapshots is deterministic and immutable.
+  // "default" lets the browser honour Cache-Control: private, immutable from the server.
   return request<DocumentVersionDiffResponse>(`/api/documents/${documentId}/versions/${versionId}/diff?against=${encodedAgainst}`, {
     token,
-    demoUser
+    demoUser,
+    cache: "default",
   });
 }
 
@@ -3561,7 +3569,8 @@ export async function getCaseLawDigestDetail(
   token?: string,
   demoUser?: string
 ): Promise<CaseLawDigestResponse> {
-  return request<CaseLawDigestResponse>(`/api/case-law/digest/history/${digestId}`, { token, demoUser });
+  // Saved digest is immutable once created. "default" respects server Cache-Control.
+  return request<CaseLawDigestResponse>(`/api/case-law/digest/history/${digestId}`, { token, demoUser, cache: "default" });
 }
 
 export async function importCaseLaw(
@@ -3984,7 +3993,9 @@ export async function getStrategyAudit(
   token?: string,
   demoUser?: string
 ): Promise<StrategyAuditResponse> {
-  return request<StrategyAuditResponse>(`/api/documents/${documentId}/strategy-audit`, { token, demoUser });
+  // Strategy audit is computed once per document and never regenerated in-place.
+  // "default" allows a short browser cache when server sends Cache-Control: private, max-age=300.
+  return request<StrategyAuditResponse>(`/api/documents/${documentId}/strategy-audit`, { token, demoUser, cache: "default" });
 }
 
 export function getExportDocxUrl(documentId: string, token?: string, demoUser?: string): string {
@@ -4030,7 +4041,9 @@ export async function getECourtCourts(
   token?: string,
   demoUser?: string
 ): Promise<ECourtCourtsResponse> {
-  return request<ECourtCourtsResponse>("/api/e-court/courts", { token, demoUser });
+  // Reference list of courts — changes < once per month.
+  // "default" allows browser caching when server sends Cache-Control: public, max-age=3600.
+  return request<ECourtCourtsResponse>("/api/e-court/courts", { token, demoUser, cache: "default" });
 }
 
 export type ECourtHearingItem = {
