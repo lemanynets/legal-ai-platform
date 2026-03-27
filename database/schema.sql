@@ -93,3 +93,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
     metadata JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS gdpr_checks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id),
+    intake_id UUID,
+    compliant BOOLEAN NOT NULL DEFAULT FALSE,
+    issues JSONB DEFAULT '[]'::jsonb,
+    personal_data_found JSONB DEFAULT '[]'::jsonb,
+    recommendations JSONB DEFAULT '[]'::jsonb,
+    report TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);

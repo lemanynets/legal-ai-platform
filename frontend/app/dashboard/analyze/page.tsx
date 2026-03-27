@@ -66,7 +66,7 @@ export default function AnalyzePage() {
   const [quickMode, setQuickMode] = useState<"standard" | "deep">("standard");
   const [intakeProgress, setIntakeProgress] = useState("");
   const [jurisdiction, setJurisdiction] = useState("UA");
-  const [gdprResult, setGdprResult] = useState<string | null>(null);
+  const [gdprResult, setGdprResult] = useState<GdprComplianceResponse | null>(null);
   const [loadingGdpr, setLoadingGdpr] = useState(false);
   const [cases, setCases] = useState<Case[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState<string>("");
@@ -192,7 +192,7 @@ export default function AnalyzePage() {
     setGdprResult(null);
     try {
       const result = await analyzeGdprCompliance({ text: intakeResult.raw_text_preview, intake_id: intakeResult.id }, getToken(), getUserId());
-      setGdprResult(result.report);
+      setGdprResult(result);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -561,10 +561,54 @@ export default function AnalyzePage() {
           )}
 
           {gdprResult && (
-            <div className="card-elevated" style={{ padding: "20px", marginTop: "18px", background: "rgba(16, 185, 129, 0.05)", border: "1px solid rgba(16, 185, 129, 0.15)" }}>
-              <h3 style={{ fontSize: "16px", color: "var(--success)", marginBottom: "10px" }}>🇪🇺 Звіт по GDPR</h3>
-              <div style={{ whiteSpace: "pre-wrap", fontSize: "13px", color: "var(--text-secondary)", maxHeight: "300px", overflowY: "auto" }}>
-                {gdprResult}
+            <div className="card-elevated" style={{ padding: "20px", marginTop: "18px", background: gdprResult.compliant ? "rgba(16, 185, 129, 0.05)" : "rgba(239, 68, 68, 0.05)", border: `1px solid ${gdprResult.compliant ? "rgba(16, 185, 129, 0.15)" : "rgba(239, 68, 68, 0.15)"}` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+                <h3 style={{ fontSize: "16px", color: gdprResult.compliant ? "var(--success)" : "var(--danger)", margin: 0 }}>
+                  {gdprResult.compliant ? "✅" : "⚠️"} Звіт по GDPR
+                </h3>
+                <span style={{
+                  padding: "4px 12px",
+                  borderRadius: "999px",
+                  fontSize: "12px",
+                  fontWeight: 700,
+                  color: gdprResult.compliant ? "var(--success)" : "var(--danger)",
+                  background: gdprResult.compliant ? "rgba(16,185,129,0.12)" : "rgba(239,68,68,0.12)",
+                }}>
+                  {gdprResult.compliant ? "Compliant" : `${gdprResult.issues.length} issues`}
+                </span>
+              </div>
+
+              {!!gdprResult.personal_data_found?.length && (
+                <div style={{ marginBottom: "14px" }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", marginBottom: "8px" }}>
+                    Знайдені персональні дані
+                  </div>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    {gdprResult.personal_data_found.map((item) => (
+                      <div key={item.type} style={{ padding: "8px 12px", borderRadius: "12px", background: "rgba(239,68,68,0.08)", fontSize: "13px" }}>
+                        <strong style={{ color: "var(--danger)" }}>{item.type}</strong>
+                        <span style={{ color: "var(--text-secondary)", marginLeft: "6px" }}>{item.count}x</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {!!gdprResult.recommendations?.length && (
+                <div style={{ marginBottom: "14px" }}>
+                  <div style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", marginBottom: "8px" }}>
+                    Рекомендації
+                  </div>
+                  <ul style={{ margin: 0, paddingLeft: "18px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                    {gdprResult.recommendations.map((rec, i) => (
+                      <li key={i} style={{ fontSize: "13px", color: "var(--text-secondary)" }}>{rec}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <div style={{ whiteSpace: "pre-wrap", fontSize: "13px", color: "var(--text-secondary)", maxHeight: "300px", overflowY: "auto", padding: "12px", background: "rgba(255,255,255,0.02)", borderRadius: "10px" }}>
+                {gdprResult.report}
               </div>
             </div>
           )}
