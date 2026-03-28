@@ -1,0 +1,98 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legal AI Platform — local Docker stack
+#
+# Usage:
+#   cp .env.docker .env.local         # fill in your API keys
+#   docker compose --env-file .env.local up --build
+#
+# Services:
+#   frontend  → http://localhost:3000   (Next.js UI)
+#   backend   → http://localhost:8000   (FastAPI)
+#   db        → localhost:5432          (PostgreSQL)
+#   redis     → localhost:6379          (cache, optional)
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       legal_ai
+      POSTGRES_USER:     legal_ai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legal_ai -d legal_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis (retrieval cache) ─────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .               # project root — gives access to both backend/ and frontend/
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:      postgresql+asyncpg://legal_ai:${POSTGRES_PASSWORD:-secret}@db:5432/legal_ai
+      REDIS_URL:         redis://redis:6379/0
+      ALLOW_DEV_AUTH:    ${ALLOW_DEV_AUTH:-true}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY:    ${OPENAI_API_KEY:-}
+      SECRET_KEY:        ${SECRET_KEY:-supersecret-change-me}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/docs > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Next.js frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # These are baked into the JS bundle — rebuild required after changes
+        NEXT_PUBLIC_API_BASE_URL:      http://localhost:8000
+        NEXT_PUBLIC_ALLOW_DEV_AUTH:    ${ALLOW_DEV_AUTH:-true}
+        NEXT_PUBLIC_SUPABASE_URL:      ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+    ports:
+      - "3000:3000"
+
+volumes:
+  pg_data:
