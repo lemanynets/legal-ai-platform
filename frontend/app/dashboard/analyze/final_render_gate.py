@@ -92,8 +92,19 @@ def evaluate_render_gate(
     ir: "DocumentIR",
     doc_type: str = "",
     generated_text: str = "",
+    processual_checks: list[dict] | None = None,
 ) -> RenderGateReport:
     """Evaluate all five render gates and return a full report.
+
+    Args:
+        ir:                 DocumentIR to evaluate.
+        doc_type:           Document type (defaults to ir.document_type).
+        generated_text:     Raw generated text for Gate 5 layout check.
+                            If empty, a plain-text rendering of the IR is used.
+        processual_checks:  List of processual validation check dicts
+                            (from generated_document.processual_validation_checks).
+                            Each dict must contain at least {"code": str, "status": str}.
+                            When None, only IR-native inconsistencies are checked.
 
     Does NOT raise — returns a RenderGateReport whose `passed` flag
     indicates whether rendering is allowed.  Use validate_final_render_gate()
@@ -113,21 +124,26 @@ def evaluate_render_gate(
         ))
 
     # ── Gate 2: No critical processual blockers ───────────────────────────
-    critical_fails = [
-        c for c in ir.legal_basis  # not the right place — check processual checks on the IR
-        # Note: processual_validation_checks live on the generated_document, not the IR.
-        # We check inconsistencies as a proxy here; the actual processual check
-        # lookup is performed against generated_document.processual_validation_checks
-        # in the export endpoint.  This gate covers the IR-native signals.
-        if False  # placeholder
-    ]
-    # Proxy: treat PROC_BLOCKER codes in ir.inconsistencies as critical
-    proc_blockers = [i for i in ir.inconsistencies if _severity_for_code(i.code) == "critical"]
-    if proc_blockers:
+    # Source 1: processual_validation_checks passed from generated_document
+    ext_blockers: list[str] = []
+    if processual_checks:
+        for chk in processual_checks:
+            code = chk.get("code", "")
+            status = chk.get("status", "")
+            if status in ("fail", "error") and _severity_for_code(code) == "critical":
+                ext_blockers.append(code)
+
+    # Source 2: IR-native inconsistencies (Inconsistency objects)
+    ir_blockers = [i.code for i in ir.inconsistencies if _severity_for_code(i.code) == "critical"]
+
+    all_blocker_codes = ext_blockers + ir_blockers
+    if all_blocker_codes:
         results.append(GateResult(
             gate=GATE_NO_PROC_BLOCKERS, passed=False,
-            detail=f"{len(proc_blockers)} критичних блокерів: "
-                   f"{', '.join(b.code for b in proc_blockers)}",
+            detail=(
+                f"{len(all_blocker_codes)} критичних блокерів: "
+                f"{', '.join(all_blocker_codes[:5])}"
+            ),
         ))
     else:
         results.append(GateResult(gate=GATE_NO_PROC_BLOCKERS, passed=True))
@@ -175,16 +191,36 @@ def validate_final_render_gate(
     ir: "DocumentIR",
     doc_type: str = "",
     generated_text: str = "",
+    processual_checks: list[dict] | None = None,
 ) -> None:
     """Raise HTTP 422 LAYOUT_COMPLIANCE_FAIL if any render gate fails.
 
-    Call this immediately before renderer.render_docx() / render_pdf():
+    Args:
+        ir:                 DocumentIR to validate.
+        doc_type:           Document type (defaults to ir.document_type).
+        generated_text:     Raw generated text for Gate 5 layout check.
+        processual_checks:  Real processual_validation_checks from the DB row
+                            (generated_document.processual_validation_checks).
+                            Pass these from the export endpoint so Gate 2
+                            evaluates actual processual blockers, not just
+                            IR-native inconsistencies.
 
-        from .final_render_gate import validate_final_render_gate
-        validate_final_render_gate(ir, doc_type="appeal_complaint")
+    Call immediately before renderer.render_docx() / render_pdf():
+
+        validate_final_render_gate(
+            ir,
+            doc_type=document.document_type,
+            generated_text=document.generated_text,
+            processual_checks=document.processual_validation_checks,
+        )
         docx_bytes = renderer.render_docx(ir)
     """
-    report = evaluate_render_gate(ir, doc_type=doc_type, generated_text=generated_text)
+    report = evaluate_render_gate(
+        ir,
+        doc_type=doc_type,
+        generated_text=generated_text,
+        processual_checks=processual_checks,
+    )
     if not report.passed:
         failed = report.failed_gates
         details = [

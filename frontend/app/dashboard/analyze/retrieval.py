@@ -242,11 +242,170 @@ async def with_timeout_budget(
 
 
 # ---------------------------------------------------------------------------
-# In-memory result cache (production: Redis / Valkey)
+# CacheBackend abstraction
 # ---------------------------------------------------------------------------
 
-_CACHE: dict[str, tuple[float, list[RetrievalResult]]] = {}
+import dataclasses
+import pickle
+from typing import Protocol, runtime_checkable
+
 _CACHE_TTL_SECONDS = 3600.0
+
+
+@runtime_checkable
+class CacheBackend(Protocol):
+    """Protocol for retrieval result caching.
+
+    Implement this interface to swap the in-process dict for Redis,
+    Memcached, or any other store without changing callers.
+    """
+
+    def get(self, key: str) -> list[RetrievalResult] | None:
+        """Return cached results or None if absent/expired."""
+        ...
+
+    def put(self, key: str, results: list[RetrievalResult], ttl: float = _CACHE_TTL_SECONDS) -> None:
+        """Store results under key with the given TTL (seconds)."""
+        ...
+
+    def delete(self, key: str) -> None:
+        """Explicitly evict a cache entry."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# In-memory backend (tests + single-process dev)
+# ---------------------------------------------------------------------------
+
+
+class InMemoryCacheBackend:
+    """Thread-safe in-memory cache using a plain dict + timestamp TTL.
+
+    NOTE: Not shared across processes.  Use RedisCacheBackend in production
+    multi-worker deployments.
+    """
+
+    def __init__(self, default_ttl: float = _CACHE_TTL_SECONDS) -> None:
+        self._store: dict[str, tuple[float, list[RetrievalResult]]] = {}
+        self._default_ttl = default_ttl
+
+    def get(self, key: str) -> list[RetrievalResult] | None:
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        ts, results = entry
+        if time.time() - ts > self._default_ttl:
+            del self._store[key]
+            return None
+        logger.debug(json.dumps({"event": "retrieval_cache_hit", "backend": "memory", "key": key[:12]}))
+        return results
+
+    def put(self, key: str, results: list[RetrievalResult], ttl: float = _CACHE_TTL_SECONDS) -> None:
+        self._store[key] = (time.time(), results)
+
+    def delete(self, key: str) -> None:
+        self._store.pop(key, None)
+
+    def clear(self) -> None:
+        """Clear all entries (useful in tests)."""
+        self._store.clear()
+
+
+# ---------------------------------------------------------------------------
+# Redis backend (production)
+# ---------------------------------------------------------------------------
+
+
+class RedisCacheBackend:
+    """Redis-backed cache for multi-process / multi-worker deployments.
+
+    Requires the `redis` package:
+        pip install redis[asyncio]   # async
+        pip install redis            # sync (used here via sync client)
+
+    Configuration via env vars:
+        REDIS_URL       redis://localhost:6379/0  (default)
+        REDIS_CACHE_DB  0                          (default)
+
+    Results are pickled before storage; only RetrievalResult dataclass
+    instances are stored — no arbitrary code execution on load.
+    """
+
+    def __init__(self, url: str | None = None, db: int | None = None) -> None:
+        self._url = url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self._db = db if db is not None else int(os.getenv("REDIS_CACHE_DB", "0"))
+        self._client: Any = None
+        self._available = False
+        self._init_client()
+
+    def _init_client(self) -> None:
+        try:
+            import redis  # noqa: PLC0415
+            self._client = redis.Redis.from_url(self._url, db=self._db, socket_connect_timeout=2)
+            self._client.ping()
+            self._available = True
+            logger.info(json.dumps({"event": "redis_cache_connected", "url": self._url[:30]}))
+        except Exception as exc:
+            logger.warning(json.dumps({
+                "event": "redis_cache_unavailable",
+                "error": str(exc)[:120],
+                "fallback": "in_memory",
+            }))
+            self._available = False
+
+    def get(self, key: str) -> list[RetrievalResult] | None:
+        if not self._available:
+            return None
+        try:
+            raw = self._client.get(f"retr:{key}")
+            if raw is None:
+                return None
+            results: list[RetrievalResult] = pickle.loads(raw)  # noqa: S301
+            logger.debug(json.dumps({"event": "retrieval_cache_hit", "backend": "redis", "key": key[:12]}))
+            return results
+        except Exception as exc:
+            logger.warning(json.dumps({"event": "redis_get_error", "error": str(exc)[:80]}))
+            return None
+
+    def put(self, key: str, results: list[RetrievalResult], ttl: float = _CACHE_TTL_SECONDS) -> None:
+        if not self._available:
+            return
+        try:
+            self._client.setex(f"retr:{key}", int(ttl), pickle.dumps(results))
+        except Exception as exc:
+            logger.warning(json.dumps({"event": "redis_put_error", "error": str(exc)[:80]}))
+
+    def delete(self, key: str) -> None:
+        if not self._available:
+            return
+        try:
+            self._client.delete(f"retr:{key}")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Active backend — swap here or inject via configure_cache_backend()
+# ---------------------------------------------------------------------------
+
+def _build_default_backend() -> CacheBackend:
+    """Build the active backend based on env vars.
+
+    - REDIS_URL set    → RedisCacheBackend (falls back to InMemory on connect error)
+    - REDIS_URL absent → InMemoryCacheBackend
+    """
+    if os.getenv("REDIS_URL"):
+        return RedisCacheBackend()
+    return InMemoryCacheBackend()
+
+
+_active_backend: CacheBackend = _build_default_backend()
+
+
+def configure_cache_backend(backend: CacheBackend) -> None:
+    """Replace the active cache backend (use in tests or app startup)."""
+    global _active_backend
+    _active_backend = backend
 
 
 def cache_key(query: str, params: dict[str, Any] | None = None) -> str:
@@ -255,19 +414,11 @@ def cache_key(query: str, params: dict[str, Any] | None = None) -> str:
 
 
 def cache_get(key: str) -> list[RetrievalResult] | None:
-    entry = _CACHE.get(key)
-    if entry is None:
-        return None
-    ts, results = entry
-    if time.time() - ts > _CACHE_TTL_SECONDS:
-        del _CACHE[key]
-        return None
-    logger.debug(json.dumps({"event": "retrieval_cache_hit", "key": key[:12]}))
-    return results
+    return _active_backend.get(key)
 
 
 def cache_put(key: str, results: list[RetrievalResult]) -> None:
-    _CACHE[key] = (time.time(), results)
+    _active_backend.put(key, results)
 
 
 # ---------------------------------------------------------------------------

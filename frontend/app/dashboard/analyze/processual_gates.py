@@ -65,15 +65,39 @@ def _load_severity_config() -> dict[str, Any]:
         return yaml.safe_load(fh)
 
 
-def _severity_for_code(code: str) -> CheckSeverity:
-    """Return severity level for a processual check code."""
+def _severity_for_code(code: str, doc_type: str = "") -> CheckSeverity:
+    """Return severity level for a processual check code.
+
+    Resolution order:
+      1. doc_type_specific[doc_type][critical|warning|info]  — per-type override
+      2. Global critical / warning / info lists
+      3. default_severity (fallback)
+
+    Args:
+        code:     Processual check code string.
+        doc_type: Optional document type for per-type severity overrides.
+    """
     cfg = _load_severity_config()
+
+    # 1. Per-doc_type override
+    if doc_type:
+        dt_cfg: dict = cfg.get("doc_type_specific", {}).get(doc_type, {})
+        if code in dt_cfg.get("critical", []):
+            return "critical"
+        if code in dt_cfg.get("warning", []):
+            return "warning"
+        if code in dt_cfg.get("info", []):
+            return "info"
+
+    # 2. Global lists
     if code in cfg.get("critical", []):
         return "critical"
     if code in cfg.get("warning", []):
         return "warning"
     if code in cfg.get("info", []):
         return "info"
+
+    # 3. Default
     default: str = cfg.get("default_severity", "warning")
     return default  # type: ignore[return-value]
 
@@ -84,20 +108,28 @@ def _severity_for_code(code: str) -> CheckSeverity:
 
 def classify_check_severity(
     checks: list[dict[str, Any]],
+    doc_type: str = "",
 ) -> list[dict[str, Any]]:
     """Return a copy of *checks* with a `severity` field added to each item.
 
     Does not mutate the input list.  Safe to call unconditionally — no
     feature flag required.
 
+    Args:
+        checks:   List of check dicts (must contain at least "code" key).
+        doc_type: Document type for per-type severity overrides (optional).
+
     Example:
-        classified = classify_check_severity(response.processual_validation_checks)
+        classified = classify_check_severity(
+            response.processual_validation_checks,
+            doc_type="appeal_complaint",
+        )
     """
     result = []
     for check in checks:
         enriched = dict(check)
         if "severity" not in enriched:
-            enriched["severity"] = _severity_for_code(check.get("code", ""))
+            enriched["severity"] = _severity_for_code(check.get("code", ""), doc_type)
         result.append(enriched)
     return result
 
@@ -202,7 +234,7 @@ async def processual_gate_check(body: ProcessualGateCheckRequest) -> ProcessualG
 
     POST /api/documents/processual-gate-check
     """
-    classified_dicts = classify_check_severity([c.model_dump() for c in body.checks])
+    classified_dicts = classify_check_severity([c.model_dump() for c in body.checks], doc_type=body.doc_type)
     classified = [ProcessualCheckItem(**c) for c in classified_dicts]
 
     blockers = [c for c in classified if c.severity == "critical" and c.status != "pass"]

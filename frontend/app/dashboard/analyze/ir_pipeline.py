@@ -178,26 +178,191 @@ async def run_ir_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# LLM stub — replace with real implementation
+# LLM extraction prompt builder
 # ---------------------------------------------------------------------------
+
+_IR_EXTRACTION_SYSTEM = """\
+Ти — юридичний асистент. Твоє завдання — проаналізувати текст українського \
+правового документа та повернути ТІЛЬКИ валідний JSON об'єкт у форматі \
+DocumentIR. Жодного додаткового тексту — тільки JSON.
+
+Обов'язкові поля у відповіді:
+- id: унікальний рядок (UUID або slug)
+- document_type: тип документа зі списку нижче або "unknown"
+- ir_version: завжди "1.0"
+- status: "needs_review"
+- header: { title, court_name, court_type, case_number, document_date, jurisdiction }
+- parties: масив { id, role, name } — мінімум 1 запис
+- facts: масив { id, text } — мінімум 1 факт
+- legal_basis: масив { id, text, citations: [], grounding_status: "draft", citation_coverage: 0.0 }
+- claims: масив { id, text, relief_type, supporting_fact_ids: [], supporting_thesis_ids: [] }
+- attachments: масив { id, title, required, provided }
+- signature_block: { signer_name, signer_role, date_placeholder: true }
+- citations: []
+- inconsistencies: []
+- citation_coverage: 0.0
+
+Для договорів (dohovir_*) court_name може бути null або порожнім рядком.
+Якщо поле відсутнє в тексті — використовуй порожній рядок або порожній масив,
+але не пропускай поле повністю.
+"""
+
+_SUPPORTED_DOC_TYPES = [
+    "pozov_do_sudu", "pozov_trudovyi", "appeal_complaint",
+    "zaява_do_sudu", "skarha_administratyvna",
+    "dohovir_kupivli_prodazhu", "dohovir_orendi", "dohovir_nadannia_posluh",
+    "pretenziya", "dovirennist",
+]
+
+
+def _build_extraction_prompt(
+    doc_type: str,
+    generated_text: str,
+    form_data: dict[str, Any],
+) -> str:
+    """Build user-turn extraction prompt with document context."""
+    form_context = ""
+    if form_data:
+        relevant_keys = [
+            "plaintiff_name", "defendant_name", "court_name", "case_number",
+            "claim_amount", "claim_description", "party_name", "contract_subject",
+            "claimant_name", "respondent_name",
+        ]
+        pairs = [
+            f"  {k}: {v}"
+            for k, v in form_data.items()
+            if k in relevant_keys and v
+        ]
+        if pairs:
+            form_context = "\n\nДані з форми введення:\n" + "\n".join(pairs)
+
+    return (
+        f"Тип документа: {doc_type}\n"
+        f"{form_context}\n\n"
+        f"Текст документа:\n{generated_text[:6000]}\n\n"
+        "Поверни JSON об'єкт DocumentIR."
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM client factory
+# ---------------------------------------------------------------------------
+
+def _get_llm_client():  # type: ignore[return]
+    """Return an Anthropic or OpenAI client depending on env vars.
+
+    Priority: ANTHROPIC_API_KEY → OPENAI_API_KEY → raise.
+    """
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    if anthropic_key:
+        try:
+            import anthropic  # noqa: PLC0415
+            return ("anthropic", anthropic.AsyncAnthropic(api_key=anthropic_key))
+        except ImportError as e:
+            raise IRParseError(
+                "anthropic Python package not installed. "
+                "Run: pip install anthropic"
+            ) from e
+
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            import openai  # noqa: PLC0415
+            return ("openai", openai.AsyncOpenAI(api_key=openai_key))
+        except ImportError as e:
+            raise IRParseError(
+                "openai Python package not installed. "
+                "Run: pip install openai"
+            ) from e
+
+    raise IRParseError(
+        "Не знайдено ANTHROPIC_API_KEY або OPENAI_API_KEY. "
+        "Встанови одну зі змінних середовища або вимкни IR pipeline: "
+        "ENABLE_DOCUMENT_IR_PIPELINE=off"
+    )
+
+
+async def _call_anthropic(client: Any, prompt: str) -> str:
+    """Call Anthropic claude-sonnet-4-6 with structured extraction."""
+    msg = await client.messages.create(
+        model=os.getenv("IR_EXTRACTION_MODEL", "claude-sonnet-4-6"),
+        max_tokens=4096,
+        system=_IR_EXTRACTION_SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+    )
+    return msg.content[0].text
+
+
+async def _call_openai(client: Any, prompt: str) -> str:
+    """Call OpenAI gpt-4o with JSON mode for structured extraction."""
+    response = await client.chat.completions.create(
+        model=os.getenv("IR_EXTRACTION_MODEL", "gpt-4o"),
+        response_format={"type": "json_object"},
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": _IR_EXTRACTION_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
+# ---------------------------------------------------------------------------
+# LLM extraction — production implementation
+# ---------------------------------------------------------------------------
+
+_MAX_RETRIES = int(os.getenv("IR_EXTRACTION_MAX_RETRIES", "2"))
+
 
 async def _generate_ir(
     generated_text: str,
     doc_type: str,
     form_data: dict[str, Any],
 ) -> DocumentIR:
-    """Generate a DocumentIR from the legacy generated_text.
+    """Extract DocumentIR from generated_text using the configured LLM.
 
-    STUB — in production this calls the LLM with a structured extraction
-    prompt and parses the JSON response via parse_ir_from_llm_output().
+    Tries up to _MAX_RETRIES times on IRParseError before giving up.
+    Falls back from Anthropic to OpenAI automatically based on env vars.
 
-    The prompt should instruct the model to output a JSON object that
-    matches the DocumentIR schema exactly.
+    Raises:
+        IRParseError  — when JSON cannot be parsed after all retries.
+        IRParseError  — when no API keys are configured.
     """
-    import uuid
+    provider, client = _get_llm_client()
+    prompt = _build_extraction_prompt(doc_type, generated_text, form_data)
 
-    # In production: replace with actual LLM call + json extraction
+    last_error: Exception | None = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            if provider == "anthropic":
+                raw = await _call_anthropic(client, prompt)
+            else:
+                raw = await _call_openai(client, prompt)
+
+            ir = parse_ir_from_llm_output(raw, doc_type)
+            if not ir.id:
+                import uuid as _uuid
+                object.__setattr__(ir, "id", str(_uuid.uuid4()))
+            return ir
+
+        except IRParseError as exc:
+            last_error = exc
+            logger.warning(json.dumps({
+                "event": "ir_extract_retry",
+                "attempt": attempt,
+                "max_retries": _MAX_RETRIES,
+                "error": str(exc)[:200],
+            }))
+            if attempt == _MAX_RETRIES:
+                break
+            # Retry with a nudge hint
+            prompt = (
+                prompt
+                + f"\n\n[Спроба {attempt} не вдалась: {str(exc)[:120]}. "
+                "Переконайся, що відповідь — ТІЛЬКИ валідний JSON без markdown-блоків.]"
+            )
+
     raise IRParseError(
-        "IR generation not yet implemented. "
-        "Set ENABLE_DOCUMENT_IR_PIPELINE=off until Wave 1 is complete."
-    )
+        f"IR extraction failed after {_MAX_RETRIES} retries: {last_error}"
+    ) from last_error

@@ -34,6 +34,7 @@ from .batch import router as batch_router
 from .comments import router as comments_router
 from .processual_gates import router as processual_gates_router  # STORY-0B
 from .export_gates import router as export_gates_router          # STORY-0C
+from .document_export import router as document_export_router    # STORY-7/8
 
 app.include_router(cases_router, prefix="/api/cases", tags=["cases"])
 app.include_router(gdpr_router, prefix="/api/analyze", tags=["gdpr"])
@@ -43,4 +44,5 @@ app.include_router(comments_router, prefix="/api/analyze", tags=["comments"])
 app.include_router(signed_url_router, prefix="/api/documents", tags=["documents"])
 app.include_router(processual_gates_router, prefix="/api/documents", tags=["processual-gates"])
 app.include_router(export_gates_router, prefix="/api/documents", tags=["export-gates"])
+app.include_router(document_export_router, prefix="/api/documents", tags=["export"])  # STORY-7/8
 app.include_router(prefs_router, prefix="/api/users", tags=["users"])

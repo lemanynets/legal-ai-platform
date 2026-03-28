@@ -74,3 +74,106 @@ info:
   - precedent_citation_suggested
   - alternative_claim_available
   - negotiation_path_available
+
+# ---------------------------------------------------------------------------
+# Doc-type-specific severity overrides
+#
+# Codes listed here override the global critical/warning/info above.
+# A code can appear under only ONE category per doc_type.
+# Unknown codes still fall back to default_severity.
+# ---------------------------------------------------------------------------
+
+doc_type_specific:
+
+  # --- Цивільні та господарські позови ---------------------------------
+  pozov_do_sudu:
+    critical:
+      - missing_claim_amount          # відсутня ціна позову → суд не може визначити збір
+      - missing_legal_basis_article   # відсутнє посилання на норму права
+      - duplicate_claim_already_filed # тотожна справа вже подана
+    warning:
+      - claim_amount_discrepancy      # розбіжність між текстом і розрахунком
+      - missing_calculation_sheet     # відсутній розрахунковий лист
+
+  # --- Трудові спори ---------------------------------------------------
+  pozov_trudovyi:
+    critical:
+      - reinstatement_deadline_missed  # пропущено 1-місячний строк на поновлення
+      - missing_dismissal_order_ref    # не зазначено наказ про звільнення
+    warning:
+      - missing_average_salary_calc    # відсутній розрахунок середнього заробітку
+      - missing_work_record_reference  # відсутнє посилання на трудову книжку
+
+  # --- Апеляційні скарги ----------------------------------------------
+  appeal_complaint:
+    critical:
+      - appeal_period_lapsed           # пропущено 30-денний строк апеляції
+      - missing_first_instance_ref     # відсутнє посилання на рішення першої інстанції
+      - missing_grounds_for_appeal     # не зазначені підстави оскарження (ст. 367 ЦПК)
+    warning:
+      - missing_court_fee_appeal       # відсутня квитанція про сплату судового збору
+      - appeal_to_wrong_court          # скарга подана не до того апеляційного суду
+
+  # --- Адміністративні скарги -----------------------------------------
+  skarha_administratyvna:
+    critical:
+      - administrative_deadline_missed # пропущено 6-місячний строк (ст. 122 КАС)
+      - missing_authority_reference    # не зазначений суб'єкт владних повноважень
+      - missing_challenged_act_ref     # відсутнє посилання на оскаржуваний акт/дію
+    warning:
+      - missing_pre_trial_complaint    # відсутнє підтвердження досудового оскарження
+      - missing_administrative_fee     # відсутня квитанція про сплату збору
+
+  # --- Договір купівлі-продажу ----------------------------------------
+  dohovir_kupivli_prodazhu:
+    critical:
+      - missing_essential_terms        # відсутні істотні умови (предмет або ціна)
+      - missing_price_clause           # відсутня ціна договору (ч. 1 ст. 691 ЦК)
+      - missing_subject_description    # відсутній опис предмета договору
+      - missing_transfer_condition     # відсутня умова про момент переходу права власності
+    warning:
+      - missing_payment_terms          # не визначений порядок оплати
+      - missing_warranty_clause        # відсутня гарантія якості товару
+
+  # --- Договір оренди -------------------------------------------------
+  dohovir_orendi:
+    critical:
+      - missing_essential_terms        # відсутні істотні умови (предмет, строк, плата)
+      - missing_rent_amount            # відсутня орендна плата (ст. 762 ЦК)
+      - missing_lease_term             # відсутній строк оренди
+      - missing_object_description     # відсутній опис об'єкта оренди
+    warning:
+      - missing_improvement_clause     # відсутнє регулювання поліпшень орендованого майна
+      - missing_early_termination      # відсутні умови дострокового розірвання
+
+  # --- Договір надання послуг -----------------------------------------
+  dohovir_nadannia_posluh:
+    critical:
+      - missing_essential_terms        # відсутні істотні умови (предмет і вартість)
+      - missing_service_description    # відсутній опис послуги (ст. 901 ЦК)
+      - missing_payment_amount         # відсутня вартість послуг
+    warning:
+      - missing_deadline_for_services  # відсутній строк надання послуг
+      - missing_acceptance_procedure   # відсутній порядок прийому-передачі
+
+  # --- Претензія ------------------------------------------------------
+  pretenziya:
+    critical:
+      - missing_claim_amount           # відсутня сума вимоги
+      - missing_legal_basis_article    # відсутнє посилання на норму права або договір
+      - missing_response_deadline      # відсутній строк для відповіді
+    warning:
+      - missing_supporting_documents   # відсутній перелік доданих документів
+      - informal_tone                  # неформальний/агресивний тон
+
+  # --- Довіреність ----------------------------------------------------
+  dovirennist:
+    critical:
+      - missing_representative_id      # відсутні ідентифікаційні дані представника
+      - missing_principal_id           # відсутні ідентифікаційні дані довірителя
+      - missing_authority_scope        # не зазначені повноваження (предмет довіреності)
+      - missing_notarization_note      # відсутня відмітка про нотаріальне посвідчення
+                                       # (якщо предмет вимагає нотаріальної форми)
+    warning:
+      - missing_expiry_date            # відсутній строк дії довіреності
+      - overly_broad_authority         # занадто широкі повноваження без конкретизації

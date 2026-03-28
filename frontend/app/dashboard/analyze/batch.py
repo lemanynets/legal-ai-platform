@@ -9,9 +9,10 @@ cache return immediately unless `invalidate_cache=True` is set.
 """
 
 import asyncio
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
@@ -32,6 +33,32 @@ router = APIRouter()
 _MAX_BATCH_CONCURRENCY = 3
 
 
+async def _fetch_content_hash(
+    session: AsyncSession,
+    document_id: str,
+    user_id: str,
+) -> Optional[str]:
+    """Load content_hash for a generated document from the DB.
+
+    Returns None when the document does not exist or has no content_hash.
+    This is the fix for the batch cache bug: previously document_id was used
+    as a cache key, which never produced cache hits for repeated uploads.
+    """
+    row = (
+        await session.execute(
+            text("""
+                SELECT content_hash
+                FROM generated_documents
+                WHERE id = :doc_id
+                  AND user_id = :user_id
+                LIMIT 1
+            """),
+            {"doc_id": document_id, "user_id": str(user_id)},
+        )
+    ).first()
+    return row.content_hash if row else None
+
+
 @router.post(
     "/batch",
     response_model=AnalyzeBatchProcessResponse,
@@ -47,27 +74,36 @@ async def analyze_batch(
     async def _process_one(document_id: str) -> AnalyzeBatchProcessResponseItem:
         async with semaphore:
             try:
-                if payload.invalidate_cache:
+                # Resolve the actual content hash for this document.
+                # Previously document_id was used directly as the cache key,
+                # which never matched anything in intake_analysis_cache.
+                content_hash = await _fetch_content_hash(
+                    session, document_id, current_user.id
+                )
+
+                if payload.invalidate_cache and content_hash:
                     await invalidate_user_cache(
                         session,
                         user_id=current_user.id,
-                        document_id=document_id,
+                        content_hash=content_hash,
                     )
+                    content_hash = None  # force re-analysis below
 
-                # Check cache first (re-uses existing content hash if present)
-                cached = await lookup_cached_analysis(
-                    session,
-                    user_id=current_user.id,
-                    content_hash=document_id,  # batch re-analysis uses doc ID as hash key
-                    jurisdiction=payload.jurisdiction,
-                    mode=payload.mode,
-                )
-                if cached is not None:
-                    return AnalyzeBatchProcessResponseItem(
-                        document_id=document_id,
-                        status="cache_hit",
-                        cache_hit=True,
+                # Check cache by actual file content hash
+                if content_hash:
+                    cached = await lookup_cached_analysis(
+                        session,
+                        user_id=current_user.id,
+                        content_hash=content_hash,
+                        jurisdiction=payload.jurisdiction,
+                        mode=payload.mode,
                     )
+                    if cached is not None:
+                        return AnalyzeBatchProcessResponseItem(
+                            document_id=document_id,
+                            status="cache_hit",
+                            cache_hit=True,
+                        )
 
                 await run_intake_analysis(
                     document_id=document_id,
