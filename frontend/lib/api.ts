@@ -82,22 +82,33 @@ export type DocumentUpdateResponse = {
   has_pdf_export: boolean;
 };
 
+// ---------------------------------------------------------------------------
+// Shared processual check item — STORY-0B
+// ---------------------------------------------------------------------------
+
+/**
+ * A single entry in processual_validation_checks / pre_generation_gate_checks.
+ *
+ * `severity` was added in Wave 0 STORY-0B.  Legacy responses that omit it
+ * are treated as "warning" by the UI.
+ */
+export type ProcessualCheckItem = {
+  code: string;
+  /** "pass" | "fail" | "warn" */
+  status: string;
+  message: string;
+  /** Severity assigned by classify_check_severity() on the backend. */
+  severity?: "critical" | "warning" | "info";
+};
+
 export type DocumentProcessualRepairResponse = {
   status: string;
   id: string;
   repaired: boolean;
   has_docx_export: boolean;
   has_pdf_export: boolean;
-  pre_generation_gate_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
-  processual_validation_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
+  pre_generation_gate_checks: ProcessualCheckItem[];
+  processual_validation_checks: ProcessualCheckItem[];
 };
 
 export type DocumentProcessualCheckResponse = {
@@ -105,16 +116,8 @@ export type DocumentProcessualCheckResponse = {
   id: string;
   is_valid: boolean;
   blockers: string[];
-  pre_generation_gate_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
-  processual_validation_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
+  pre_generation_gate_checks: ProcessualCheckItem[];
+  processual_validation_checks: ProcessualCheckItem[];
 };
 
 export type DocumentBulkProcessualRepairResponse = {
@@ -431,16 +434,8 @@ export type GenerateResponse = {
   ai_model: string;
   ai_error: string;
   quality_guard_applied: boolean;
-  pre_generation_gate_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
-  processual_validation_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
+  pre_generation_gate_checks: ProcessualCheckItem[];
+  processual_validation_checks: ProcessualCheckItem[];
   case_id: string | null;
   case_law_refs: {
     id: string;
@@ -592,16 +587,8 @@ export type AutoProcessDocumentItem = {
   ai_model: string | null;
   ai_error: string | null;
   quality_guard_applied: boolean;
-  pre_generation_gate_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
-  processual_validation_checks: {
-    code: string;
-    status: string;
-    message: string;
-  }[];
+  pre_generation_gate_checks: ProcessualCheckItem[];
+  processual_validation_checks: ProcessualCheckItem[];
 };
 
 export type AutoProcessResponse = {
@@ -4491,4 +4478,86 @@ export async function deleteAnalysisComment(
     token,
     demoUser,
   });
+}
+
+// ---------------------------------------------------------------------------
+// STORY-0B — Processual gate check
+// ---------------------------------------------------------------------------
+
+export type ProcessualGateCheckResponse = {
+  checks: ProcessualCheckItem[];
+  has_critical_blockers: boolean;
+  blockers: ProcessualCheckItem[];
+  warnings: ProcessualCheckItem[];
+  infos: ProcessualCheckItem[];
+  /**
+   * True only when ENABLE_BLOCKING_PROCESSUAL_GATES is active AND
+   * there are critical blockers.
+   */
+  would_block_generation: boolean;
+};
+
+/**
+ * Classify a list of processual_validation_checks server-side and get
+ * severity groupings.
+ *
+ * Use this on the staging dashboard or before offering the Generate button
+ * when a document already has stored checks.
+ *
+ * POST /api/documents/processual-gate-check
+ */
+export async function checkProcessualGate(
+  checks: ProcessualCheckItem[],
+  docType = "",
+  token?: string,
+  demoUser?: string
+): Promise<ProcessualGateCheckResponse> {
+  return request<ProcessualGateCheckResponse>("/api/documents/processual-gate-check", {
+    method: "POST",
+    body: { checks, doc_type: docType },
+    token,
+    demoUser,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// STORY-0C — Export readiness
+// ---------------------------------------------------------------------------
+
+export type ReadinessCheckResult = {
+  code: string;
+  label: string;
+  passed: boolean;
+  severity: "critical" | "warning" | "info";
+};
+
+export type ExportReadinessResponse = {
+  doc_type: string;
+  /** True only when all checks pass. */
+  ready: boolean;
+  checks: ReadinessCheckResult[];
+  /** Error codes of failing checks. */
+  blocking_codes: string[];
+};
+
+/**
+ * Check filing readiness without producing an export artifact.
+ *
+ * Call before showing the "Download DOCX/PDF" button.  If `ready` is false,
+ * surface `blocking_codes` to the user so they know which elements to fix.
+ *
+ * GET /api/documents/{documentId}/export-readiness
+ */
+export async function checkExportReadiness(
+  documentId: string,
+  docType: string,
+  generatedText: string,
+  token?: string,
+  demoUser?: string
+): Promise<ExportReadinessResponse> {
+  const search = new URLSearchParams({ doc_type: docType, generated_text: generatedText });
+  return request<ExportReadinessResponse>(
+    `/api/documents/${documentId}/export-readiness?${search.toString()}`,
+    { token, demoUser }
+  );
 }

@@ -529,24 +529,67 @@ export default function GeneratePage() {
         </div>
       )}
 
-      {/* Structured processual blockers block (PROC_BLOCKER) */}
-      {blockers.length > 0 && (
-        <div className="card-elevated" style={{ padding: "14px 18px", borderLeft: "3px solid var(--danger)", background: "rgba(239,68,68,0.06)" }}>
-          <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--danger)", marginBottom: "8px" }}>
-            Процесуальні блокери — генерація неможлива
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-            {blockers.map((b, i) => (
-              <div key={i} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
-                <span style={{ padding: "2px 8px", borderRadius: "6px", fontSize: "11px", fontWeight: 700, background: "rgba(239,68,68,0.18)", color: "var(--danger)", flexShrink: 0 }}>
-                  {b.code}
-                </span>
-                <span style={{ color: "var(--text-secondary)" }}>{b.message}</span>
+      {/* Structured processual blockers block (PROC_BLOCKER) — split by severity */}
+      {blockers.length > 0 && (() => {
+        const criticals = blockers.filter(b => !b.severity || b.severity === "critical");
+        const warnings  = blockers.filter(b => b.severity === "warning");
+        const infos     = blockers.filter(b => b.severity === "info");
+        return (
+          <>
+            {criticals.length > 0 && (
+              <div className="card-elevated" style={{ padding: "14px 18px", borderLeft: "3px solid var(--danger)", background: "rgba(239,68,68,0.06)" }}>
+                <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--danger)", marginBottom: "8px" }}>
+                  Процесуальні блокери — генерація заблокована
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                  {criticals.map((b, i) => (
+                    <div key={i} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
+                      <span style={{ padding: "2px 8px", borderRadius: "6px", fontSize: "11px", fontWeight: 700, background: "rgba(239,68,68,0.18)", color: "var(--danger)", flexShrink: 0 }}>
+                        {b.code}
+                      </span>
+                      <span style={{ color: "var(--text-secondary)" }}>{b.message}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
-            ))}
-          </div>
-        </div>
-      )}
+            )}
+            {warnings.length > 0 && (
+              <div className="card-elevated" style={{ padding: "14px 18px", borderLeft: "3px solid var(--warning)", background: "rgba(245,158,11,0.06)" }}>
+                <div style={{ fontSize: "13px", fontWeight: 700, color: "var(--warning)", marginBottom: "8px" }}>
+                  Попередження — генерацію дозволено, але є зауваження
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                  {warnings.map((b, i) => (
+                    <div key={i} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
+                      <span style={{ padding: "2px 8px", borderRadius: "6px", fontSize: "11px", fontWeight: 700, background: "rgba(245,158,11,0.18)", color: "var(--warning)", flexShrink: 0 }}>
+                        {b.code}
+                      </span>
+                      <span style={{ color: "var(--text-secondary)" }}>{b.message}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {infos.length > 0 && (
+              <div className="card-elevated" style={{ padding: "14px 18px", borderLeft: "3px solid #60a5fa", background: "rgba(96,165,250,0.06)" }}>
+                <div style={{ fontSize: "13px", fontWeight: 600, color: "#60a5fa", marginBottom: "8px" }}>
+                  Рекомендації
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                  {infos.map((b, i) => (
+                    <div key={i} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
+                      <span style={{ padding: "2px 8px", borderRadius: "6px", fontSize: "11px", fontWeight: 600, background: "rgba(96,165,250,0.12)", color: "#60a5fa", flexShrink: 0 }}>
+                        {b.code}
+                      </span>
+                      <span style={{ color: "var(--text-secondary)" }}>{b.message}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        );
+      })()}
 
       {selectedCaseDetail && (
         <div className="card-elevated" style={{ padding: "16px 18px", border: "1px solid rgba(96,165,250,0.18)", background: "rgba(96,165,250,0.06)" }}>
@@ -1042,28 +1085,64 @@ export default function GeneratePage() {
               </div>
             )}
 
-            {displayResult?.processual_validation_checks && displayResult.processual_validation_checks.length > 0 && (
-              <div className="card-elevated" style={{ padding: "20px" }}>
-                <h3 style={{ fontSize: "16px", fontWeight: 700, marginBottom: "12px", color: "var(--text-primary)" }}>
-                  Processual validation
-                </h3>
-                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
-                  {displayResult.processual_validation_checks.map((item: any) => (
-                    <div key={item.code} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
-                      <span
-                        className={`badge ${
-                          item.status === "pass" ? "badge-success" : item.status === "warn" ? "badge-warning" : "badge-danger"
-                        } badge`}
-                        style={{ minWidth: "52px", justifyContent: "center" }}
-                      >
-                        {item.status}
+            {displayResult?.processual_validation_checks && displayResult.processual_validation_checks.length > 0 && (() => {
+              const checks = displayResult.processual_validation_checks;
+              const criticalFails = checks.filter(c => c.status !== "pass" && (!c.severity || c.severity === "critical"));
+              const warningFails  = checks.filter(c => c.status !== "pass" && c.severity === "warning");
+              const passes        = checks.filter(c => c.status === "pass");
+              const borderColor = criticalFails.length > 0 ? "var(--danger)" : warningFails.length > 0 ? "var(--warning)" : "var(--success)";
+              return (
+                <div className="card-elevated" style={{ padding: "20px", borderLeft: `3px solid ${borderColor}` }}>
+                  <h3 style={{ fontSize: "16px", fontWeight: 700, marginBottom: "12px", color: "var(--text-primary)" }}>
+                    Процесуальна валідація
+                    {criticalFails.length > 0 && (
+                      <span style={{ marginLeft: "8px", fontSize: "12px", fontWeight: 700, color: "var(--danger)" }}>
+                        {criticalFails.length} критичних
                       </span>
-                      <span className="text-secondary">{item.message}</span>
+                    )}
+                    {warningFails.length > 0 && (
+                      <span style={{ marginLeft: "8px", fontSize: "12px", fontWeight: 600, color: "var(--warning)" }}>
+                        {warningFails.length} попереджень
+                      </span>
+                    )}
+                  </h3>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                    {checks.map((item, idx) => {
+                      const isFailing = item.status !== "pass";
+                      const sev = item.severity ?? (isFailing ? "critical" : undefined);
+                      const statusClass = item.status === "pass"
+                        ? "badge-success"
+                        : sev === "critical" ? "badge-danger"
+                        : sev === "warning" ? "badge-warning"
+                        : "badge-secondary";
+                      return (
+                        <div key={`${item.code}-${idx}`} style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "13px" }}>
+                          <span className={`badge ${statusClass}`} style={{ minWidth: "52px", justifyContent: "center" }}>
+                            {item.status}
+                          </span>
+                          {isFailing && sev && (
+                            <span style={{
+                              padding: "2px 6px", borderRadius: "4px", fontSize: "10px", fontWeight: 700, flexShrink: 0,
+                              background: sev === "critical" ? "rgba(239,68,68,0.18)" : sev === "warning" ? "rgba(245,158,11,0.18)" : "rgba(96,165,250,0.12)",
+                              color: sev === "critical" ? "var(--danger)" : sev === "warning" ? "var(--warning)" : "#60a5fa",
+                              textTransform: "uppercase",
+                            }}>
+                              {sev}
+                            </span>
+                          )}
+                          <span className="text-secondary">{item.message}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {passes.length > 0 && criticalFails.length + warningFails.length > 0 && (
+                    <div style={{ marginTop: "8px", fontSize: "12px", color: "var(--text-muted)" }}>
+                      {passes.length} перевірок пройдено успішно
                     </div>
-                  ))}
+                  )}
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             {displayResult?.generated_text && (
               <div className="card-elevated" style={{ padding: "20px" }}>

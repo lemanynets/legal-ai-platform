@@ -1,0 +1,76 @@
+# Wave 0 · STORY-0B — Processual check severity classification.
+#
+# Maps processual_validation_check codes → severity level.
+# Used by processual_gates.py classify_check_severity().
+#
+# Severity levels:
+#   critical → blocks generation (when ENABLE_BLOCKING_PROCESSUAL_GATES=true)
+#              and blocks export/finalize in all cases
+#   warning  → shown to user, does NOT block
+#   info     → informational only, collapsed by default in UI
+#
+# Any code not listed here falls back to default_severity.
+
+default_severity: warning
+
+critical:
+  # Jurisdiction / court competence
+  - court_jurisdiction_incorrect
+  - incompetent_court
+  - subject_matter_jurisdiction_fail
+  - court_not_identified
+  - missing_court_identifier
+  # Res judicata / procedural bars
+  - res_judicata
+  - case_already_decided
+  - parallel_proceedings_active
+  # Statute of limitations
+  - statute_of_limitations_violation
+  - limitation_period_expired
+  # Mandatory structural elements
+  - missing_parties
+  - missing_mandatory_claim_element
+  - missing_signature_required
+  - missing_plaintiff_identifier
+  - missing_defendant_identifier
+  # Procedural deadlines
+  - procedural_deadline_missed
+  - appeal_period_expired
+  - cassation_period_expired
+  # Filing readiness codes (shared with export gates)
+  - MISSING_COURT
+  - MISSING_PARTIES
+  - MISSING_CLAIMS
+  - MISSING_SIGNATURE_BLOCK
+
+warning:
+  # Financial / fee issues
+  - claim_calculation_discrepancy
+  - court_fee_calculation_issue
+  - court_fee_underpaid
+  - interest_calculation_discrepancy
+  - currency_mismatch
+  # Evidence and parties
+  - party_identification_minor
+  - evidence_list_incomplete
+  - missing_evidence_reference
+  - witness_count_low
+  # Language and format
+  - language_compliance_minor
+  - date_format_inconsistency
+  - document_numbering_gap
+  - reference_format_non_standard
+  # Optional structural
+  - missing_optional_element
+  - missing_attachments_list
+  - MISSING_ATTACHMENTS
+
+info:
+  # Style and quality
+  - style_recommendation
+  - citation_suggestion
+  - formatting_tip
+  - optional_section_missing
+  - precedent_citation_suggested
+  - alternative_claim_available
+  - negotiation_path_available

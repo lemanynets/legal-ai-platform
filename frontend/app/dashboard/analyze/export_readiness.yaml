@@ -1,0 +1,156 @@
+# Wave 0 · STORY-0C — Filing readiness checklist per document type.
+#
+# Used by export_gates.py validate_export_readiness().
+#
+# Schema per check:
+#   code:     machine-readable error code (maps to ErrorCode in error-codes.ts)
+#   label:    Ukrainian label shown to user
+#   patterns: list of Ukrainian text patterns searched case-insensitively in
+#             the generated document text.  At least ONE must match.
+#   min_chars: if set, the generated_text must be at least this many chars long.
+#   applies_to: list of doc_type values this check applies to.
+#              Omit to apply to ALL types.
+
+# ---------------------------------------------------------------------------
+# Global checks — applied to every doc_type unless overridden below.
+# ---------------------------------------------------------------------------
+_global:
+  checks:
+    - code: MISSING_COURT
+      label: "Назва суду"
+      patterns:
+        - "суд"
+        - "Суд"
+        - "господарський суд"
+        - "районний суд"
+        - "апеляційний суд"
+        - "адміністративний суд"
+        - "court"
+      # Contracts & powers of attorney don't need a court
+      skip_for:
+        - dohovir_kupivli_prodazhu
+        - dohovir_orendi
+        - dohovir_nadannia_posluh
+        - dovirennist
+        - pretenziya
+
+    - code: MISSING_PARTIES
+      label: "Сторони (позивач / відповідач або сторони договору)"
+      patterns:
+        - "позивач"
+        - "Позивач"
+        - "відповідач"
+        - "Відповідач"
+        - "продавець"
+        - "Продавець"
+        - "покупець"
+        - "Покупець"
+        - "орендодавець"
+        - "Орендодавець"
+        - "орендар"
+        - "Орендар"
+        - "виконавець"
+        - "Виконавець"
+        - "замовник"
+        - "Замовник"
+        - "довіритель"
+        - "Довіритель"
+        - "заявник"
+        - "Заявник"
+
+    - code: MISSING_SIGNATURE_BLOCK
+      label: "Блок підпису"
+      patterns:
+        - "________"
+        - "_____"
+        - "підпис"
+        - "Підпис"
+        - "підписано"
+        - "Підписано"
+        - "підписаний"
+
+# ---------------------------------------------------------------------------
+# Court filing types — extra checks for prохальна частина (claims).
+# ---------------------------------------------------------------------------
+pozov_do_sudu:
+  extra_checks:
+    - code: MISSING_CLAIMS
+      label: "Прохальна частина (прошу суд)"
+      patterns:
+        - "ПРОШУ"
+        - "прошу суд"
+        - "Прошу суд"
+        - "прошу:"
+        - "Прошу:"
+
+pozov_trudovyi:
+  extra_checks:
+    - code: MISSING_CLAIMS
+      label: "Прохальна частина (прошу суд)"
+      patterns:
+        - "ПРОШУ"
+        - "прошу суд"
+        - "Прошу суд"
+
+zaява_do_sudu:
+  extra_checks:
+    - code: MISSING_CLAIMS
+      label: "Зміст заяви (прошу)"
+      patterns:
+        - "прошу"
+        - "Прошу"
+        - "ПРОШУ"
+
+skarha_administratyvna:
+  extra_checks:
+    - code: MISSING_CLAIMS
+      label: "Прохальна частина (прошу скасувати / зобов'язати)"
+      patterns:
+        - "прошу"
+        - "Прошу"
+        - "ПРОШУ"
+        - "зобов'язати"
+        - "скасувати"
+
+# ---------------------------------------------------------------------------
+# Contract types — signature block is the primary gate.
+# Title check is optional for contracts (often embedded in the heading).
+# ---------------------------------------------------------------------------
+dohovir_kupivli_prodazhu:
+  extra_checks: []
+
+dohovir_orendi:
+  extra_checks: []
+
+dohovir_nadannia_posluh:
+  extra_checks: []
+
+# ---------------------------------------------------------------------------
+# Pretension — no court section needed, but claims are required.
+# ---------------------------------------------------------------------------
+pretenziya:
+  extra_checks:
+    - code: MISSING_CLAIMS
+      label: "Зміст вимоги"
+      patterns:
+        - "вимагаю"
+        - "Вимагаю"
+        - "прошу"
+        - "Прошу"
+        - "зобов'язати"
+        - "відшкодувати"
+
+# ---------------------------------------------------------------------------
+# Power of attorney — no court, no claims; only parties + scope required.
+# ---------------------------------------------------------------------------
+dovirennist:
+  extra_checks:
+    - code: MISSING_CLAIMS
+      label: "Обсяг повноважень"
+      patterns:
+        - "уповноважую"
+        - "Уповноважую"
+        - "доручаю"
+        - "Доручаю"
+        - "надаю право"
+        - "Надаю право"

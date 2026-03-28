@@ -10,6 +10,79 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+# ---------------------------------------------------------------------------
+# STORY-0B — Processual severity enum
+# ---------------------------------------------------------------------------
+
+CheckSeverity = Literal["critical", "warning", "info"]
+
+
+class ProcessualCheckItem(BaseModel):
+    """A single processual validation check with severity classification.
+
+    Wave 0 contract — backend MUST include `severity` in every
+    processual_validation_checks item when STORY-0B is active.
+    """
+
+    code: str
+    status: str
+    """'pass' | 'fail' | 'warn' — result of the check."""
+    message: str
+    severity: CheckSeverity = "warning"
+    """Severity assigned by classify_check_severity(); defaults to 'warning'
+    so that legacy responses without this field are backward-compatible."""
+
+
+# ---------------------------------------------------------------------------
+# STORY-0B — processual-gate-check endpoint
+# ---------------------------------------------------------------------------
+
+
+class ProcessualGateCheckRequest(BaseModel):
+    """Request body for POST /api/documents/processual-gate-check."""
+
+    checks: List[ProcessualCheckItem]
+    doc_type: str = ""
+
+
+class ProcessualGateCheckResponse(BaseModel):
+    """Response for POST /api/documents/processual-gate-check."""
+
+    checks: List[ProcessualCheckItem]
+    has_critical_blockers: bool
+    blockers: List[ProcessualCheckItem]
+    """Checks that are critical AND non-passing."""
+    warnings: List[ProcessualCheckItem]
+    infos: List[ProcessualCheckItem]
+    would_block_generation: bool
+    """True only when ENABLE_BLOCKING_PROCESSUAL_GATES is active AND
+    there are critical blockers."""
+
+
+# ---------------------------------------------------------------------------
+# STORY-0C — Export readiness
+# ---------------------------------------------------------------------------
+
+
+class ReadinessCheckResult(BaseModel):
+    """Result of a single filing-readiness check."""
+
+    code: str
+    label: str
+    passed: bool
+    severity: CheckSeverity = "critical"
+
+
+class ExportReadinessResponse(BaseModel):
+    """Response for GET /api/documents/{doc_id}/export-readiness."""
+
+    doc_type: str
+    ready: bool
+    """True only when all checks pass."""
+    checks: List[ReadinessCheckResult]
+    blocking_codes: List[str]
+    """Codes of failing checks (always critical for Wave 0)."""
+
 
 class AnalyzeIntakeRequest(BaseModel):
     """Single-file intake analysis request.
