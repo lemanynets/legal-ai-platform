@@ -3963,6 +3963,7 @@ export async function generateWithStrategy(
     form_data?: Record<string, unknown>;
     extra_prompt_context?: string;
     target_language?: TargetLanguage;
+    case_id?: string;
   },
   token?: string,
   demoUser?: string
