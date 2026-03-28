@@ -10,7 +10,7 @@ const BACKEND_URL =
 
 export const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
-const isDevAuthEnabled = allowDevAuth || !supabase;
+export const isDevAuthEnabled = allowDevAuth || !supabase;
 const SESSION_KEY = "legal_ai_session";
 const PRO_PLUS_EMAILS = new Set(["lemaninets1985@gmail.com"]);
 const PRO_PLUS_USER_IDS = new Set(["dev-lemaninets1985"]);

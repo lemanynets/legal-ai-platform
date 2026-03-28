@@ -2,7 +2,7 @@
 
 import React, { useState } from "react";
 import { useRouter } from "next/navigation";
-import { login, registerUser } from "@/lib/auth";
+import { login, registerUser, devLogin, isDevAuthEnabled } from "@/lib/auth";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -19,9 +19,18 @@ export default function LoginPage() {
     setLoading(true);
     try {
       if (isLogin) {
-        await login(email, password);
+        // Use devLogin when Supabase is not configured (local dev mode)
+        if (isDevAuthEnabled) {
+          await devLogin(email, password);
+        } else {
+          await login(email, password);
+        }
       } else {
-        await registerUser(email, password, fullName);
+        if (isDevAuthEnabled) {
+          await devLogin(email || "dev@legal-ai.local", password || "dev");
+        } else {
+          await registerUser(email, password, fullName);
+        }
       }
       router.replace("/dashboard");
     } catch (err) {
@@ -168,6 +177,22 @@ export default function LoginPage() {
           </form>
 
           <hr className="divider" style={{ margin: "24px 0 20px" }} />
+
+          {isDevAuthEnabled && (
+            <div style={{
+              background: "rgba(212,168,67,0.08)",
+              border: "1px solid rgba(212,168,67,0.25)",
+              borderRadius: "8px",
+              padding: "12px 14px",
+              marginBottom: "16px",
+              fontSize: "12px",
+              color: "var(--text-muted)",
+              lineHeight: 1.6,
+            }}>
+              <strong style={{ color: "var(--gold-400)" }}>Dev режим</strong> — Supabase не налаштований.<br />
+              Введіть будь-який email і пароль (мін. 6 символів).
+            </div>
+          )}
 
           <p style={{ fontSize: "13px", color: "var(--text-muted)", textAlign: "center", lineHeight: 1.6 }}>
             Необхідна допомога?{" "}
