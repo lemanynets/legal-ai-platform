@@ -23,7 +23,7 @@ export const themeCSS = `
   --surface-hover: rgba(255, 255, 255, 0.06);
   --border: rgba(255, 255, 255, 0.06);
   --border-strong: rgba(255, 255, 255, 0.12);
-  --sidebar-w: 280px;
+  --sidebar-w: 260px;
   --topbar-h: 72px;
   --radius: 16px;
   --radius-sm: 10px;
