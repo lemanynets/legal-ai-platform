@@ -1,8 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // Required for a minimal Docker image (Next.js standalone output)
-  output: "standalone",
+  // Note: "standalone" output is for Docker only — Railway uses npm start directly
   // Prevent browser caching of JS chunks in development
   headers: async () => {
     if (process.env.NODE_ENV !== "production") {
