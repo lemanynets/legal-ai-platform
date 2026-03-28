@@ -25,6 +25,7 @@ app.add_middleware(
 # Router registration
 # ---------------------------------------------------------------------------
 
+from app.auth import router as auth_router
 from .cases import router as cases_router
 from .gdpr import router as gdpr_router
 from .intake import router as intake_router
@@ -36,6 +37,7 @@ from .processual_gates import router as processual_gates_router  # STORY-0B
 from .export_gates import router as export_gates_router          # STORY-0C
 from .document_export import router as document_export_router    # STORY-7/8
 
+app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(cases_router, prefix="/api/cases", tags=["cases"])
 app.include_router(gdpr_router, prefix="/api/analyze", tags=["gdpr"])
 app.include_router(intake_router, prefix="/api/analyze", tags=["intake"])
