@@ -28,6 +28,12 @@ from .document_ir import (  # noqa: F401  (re-exports)
     SignatureBlock,
 )
 
+# Re-export Wave 4 render-gate types
+from .final_render_gate import (  # noqa: F401  (re-exports)
+    GateResult,
+    RenderGateReport,
+)
+
 # ---------------------------------------------------------------------------
 # STORY-0B — Processual severity enum
 # ---------------------------------------------------------------------------

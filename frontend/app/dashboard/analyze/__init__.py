@@ -32,6 +32,9 @@ from .schemas import (
     LegalThesis,
     PartyItem,
     SignatureBlock,
+    # Wave 4 — render gate
+    GateResult,
+    RenderGateReport,
 )
 
 __all__ = [
@@ -60,4 +63,7 @@ __all__ = [
     "CitationItem",
     "Inconsistency",
     "IRDocumentStatus",
+    # STORY-8 — render gate
+    "GateResult",
+    "RenderGateReport",
 ]

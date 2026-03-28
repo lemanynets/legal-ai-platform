@@ -1,0 +1,48 @@
+# Wave 0–4 feature flag overrides per doc_type.
+# Global defaults are read from environment variables (see feature_flags.py).
+# Values here override the env var for specific doc_types only.
+#
+# Hot reload: POST /api/admin/reload-flags  OR  call feature_flags.reload()
+#
+# Legend:
+#   bool flags  — true / false
+#   ir_pipeline — off / shadow / on
+
+# ── Wave 0 ────────────────────────────────────────────────────────────────
+
+required_input_gates:
+  per_doc_type:
+    # Enabled first for simple filings; expand as DoD tests pass
+    pozov_do_sudu: false
+    zaява_do_sudu: false
+
+blocking_processual_gates:
+  per_doc_type:
+    # Will be enabled after STORY-0B staging validation
+    pozov_do_sudu: false
+
+# ── Wave 1–2 ──────────────────────────────────────────────────────────────
+
+ir_pipeline:
+  per_doc_type:
+    # appeal_complaint first in shadow — gather metrics, user sees legacy
+    appeal_complaint: shadow
+
+sectional_generation:
+  per_doc_type:
+    # Will enable after STORY-3 integration test is green
+    appeal_complaint: false
+
+# ── Wave 3 ────────────────────────────────────────────────────────────────
+
+citation_grounding_gate:
+  per_doc_type:
+    # Enable only after golden legal review passes
+    appeal_complaint: false
+
+# ── Wave 4 ────────────────────────────────────────────────────────────────
+
+ir_renderer:
+  per_doc_type:
+    # Enable after snapshot tests pass + legal layout sign-off
+    appeal_complaint: false
