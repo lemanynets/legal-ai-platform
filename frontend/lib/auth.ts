@@ -210,6 +210,11 @@ export function getUserId(): string {
 }
 
 export async function login(email: string, password: string): Promise<UserSession> {
+  // When Supabase is not configured, always use devLogin (works offline, no backend needed)
+  if (isDevAuthEnabled) {
+    return devLogin(email, password);
+  }
+
   const data = await performAuthRequest(
     "/api/auth/login",
     { email, password },
@@ -234,6 +239,11 @@ export async function login(email: string, password: string): Promise<UserSessio
 }
 
 export async function registerUser(email: string, password: string, fullName?: string): Promise<UserSession> {
+  // Dev mode: treat register same as login
+  if (isDevAuthEnabled) {
+    return devLogin(email || "dev@legal-ai.local", password || "dev");
+  }
+
   const data = await performAuthRequest(
     "/api/auth/register",
     { email, password, full_name: fullName },
