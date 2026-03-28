@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 import { getToken, getUserId } from "@/lib/auth";
 import {
   autoProcessDecisionAnalysis,
@@ -21,7 +22,7 @@ import {
   type DecisionAnalysisResponse
 } from "@/lib/api";
 
-export default function DecisionAnalysisPage() {
+function DecisionAnalysisPageInner() {
   const searchParams = useSearchParams();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [includeRecentCaseLaw, setIncludeRecentCaseLaw] = useState(true);
@@ -358,5 +359,13 @@ export default function DecisionAnalysisPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function DecisionAnalysisPage() {
+  return (
+    <Suspense fallback={null}>
+      <DecisionAnalysisPageInner />
+    </Suspense>
   );
 }

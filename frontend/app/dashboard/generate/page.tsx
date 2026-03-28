@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 
 import { getSession, getToken, getUserId } from "@/lib/auth";
 import {
@@ -82,7 +83,7 @@ function SummaryStat({ label, value }: { label: string; value: string | number }
   );
 }
 
-export default function GeneratePage() {
+function GeneratePageInner() {
   const searchParams = useSearchParams();
   const [docTypes, setDocTypes] = useState<DocumentType[]>([]);
   const [selectedDocType, setSelectedDocType] = useState("");
@@ -1200,5 +1201,13 @@ export default function GeneratePage() {
         )}
       </section>
     </div>
+  );
+}
+
+export default function GeneratePage() {
+  return (
+    <Suspense fallback={null}>
+      <GeneratePageInner />
+    </Suspense>
   );
 }

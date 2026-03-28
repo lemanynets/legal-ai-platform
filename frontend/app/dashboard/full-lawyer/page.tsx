@@ -2,6 +2,7 @@
 
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 
 import { getToken, getUserId } from "@/lib/auth";
 import {
@@ -190,7 +191,7 @@ function Section({ title, value }: { title: string; value: unknown }) {
   );
 }
 
-export default function FullLawyerPage() {
+function FullLawyerPageInner() {
   const searchParams = useSearchParams();
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
@@ -410,5 +411,13 @@ export default function FullLawyerPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function FullLawyerPage() {
+  return (
+    <Suspense fallback={null}>
+      <FullLawyerPageInner />
+    </Suspense>
   );
 }
