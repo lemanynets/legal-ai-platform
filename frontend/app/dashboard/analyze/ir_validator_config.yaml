@@ -1,0 +1,111 @@
+# Wave 1 · STORY-1 — IR validator configuration per document type.
+#
+# Defines what sections and fields are REQUIRED for each doc_type to pass
+# IRValidationError-free.  Used by ir_validator.py validate_ir().
+#
+# Keys per doc_type:
+#   required_sections:      top-level IR fields that must be non-empty
+#   required_party_roles:   party.role values that must appear at least once
+#   required_header_fields: DocumentHeader fields that must be non-null
+#   min_facts:              minimum FactItem entries
+#   min_legal_basis:        minimum LegalThesis entries
+#   min_claims:             minimum ClaimItem entries
+#   signature_required:     must have a non-null signature_block
+#
+# Fallback: _default applied to any doc_type not explicitly listed.
+
+_default:
+  required_sections: [header, parties, claims, signature_block]
+  required_party_roles: []
+  required_header_fields: [title]
+  min_facts: 0
+  min_legal_basis: 0
+  min_claims: 1
+  signature_required: true
+
+# ── Court filings ──────────────────────────────────────────────────────────
+
+pozov_do_sudu:
+  required_sections: [header, parties, facts, legal_basis, claims, signature_block]
+  required_party_roles: [позивач, відповідач]
+  required_header_fields: [title, court_name]
+  min_facts: 1
+  min_legal_basis: 1
+  min_claims: 1
+  signature_required: true
+
+pozov_trudovyi:
+  required_sections: [header, parties, facts, legal_basis, claims, signature_block]
+  required_party_roles: [позивач, відповідач]
+  required_header_fields: [title, court_name]
+  min_facts: 1
+  min_legal_basis: 1
+  min_claims: 1
+  signature_required: true
+
+zaява_do_sudu:
+  required_sections: [header, parties, claims, signature_block]
+  required_party_roles: [заявник]
+  required_header_fields: [title, court_name]
+  min_facts: 0
+  min_legal_basis: 0
+  min_claims: 1
+  signature_required: true
+
+skarha_administratyvna:
+  required_sections: [header, parties, facts, legal_basis, claims, signature_block]
+  required_party_roles: [позивач, відповідач]
+  required_header_fields: [title, court_name]
+  min_facts: 1
+  min_legal_basis: 1
+  min_claims: 1
+  signature_required: true
+
+# ── Contracts ─────────────────────────────────────────────────────────────
+
+dohovir_kupivli_prodazhu:
+  required_sections: [header, parties, claims, signature_block]
+  required_party_roles: [продавець, покупець]
+  required_header_fields: [title]
+  min_facts: 0
+  min_legal_basis: 0
+  min_claims: 1
+  signature_required: true
+
+dohovir_orendi:
+  required_sections: [header, parties, claims, signature_block]
+  required_party_roles: [орендодавець, орендар]
+  required_header_fields: [title]
+  min_facts: 0
+  min_legal_basis: 0
+  min_claims: 1
+  signature_required: true
+
+dohovir_nadannia_posluh:
+  required_sections: [header, parties, claims, signature_block]
+  required_party_roles: [виконавець, замовник]
+  required_header_fields: [title]
+  min_facts: 0
+  min_legal_basis: 0
+  min_claims: 1
+  signature_required: true
+
+# ── Other ─────────────────────────────────────────────────────────────────
+
+pretenziya:
+  required_sections: [header, parties, claims, signature_block]
+  required_party_roles: []
+  required_header_fields: [title]
+  min_facts: 0
+  min_legal_basis: 0
+  min_claims: 1
+  signature_required: true
+
+dovirennist:
+  required_sections: [header, parties, claims, signature_block]
+  required_party_roles: [довіритель, представник]
+  required_header_fields: [title]
+  min_facts: 0
+  min_legal_basis: 0
+  min_claims: 1
+  signature_required: true

@@ -1,0 +1,17 @@
+# Wave 1 · STORY-2 — Per-doc_type IR pipeline mode overrides.
+#
+# Global default is read from ENABLE_DOCUMENT_IR_PIPELINE env var.
+# Per-doc_type overrides here take precedence.
+#
+# Values: off | shadow | on
+#
+# Hot reload: call reload_pipeline_config() or restart the process.
+# The lru_cache in ir_pipeline.py is cleared by reload_pipeline_config().
+
+per_doc_type:
+  # Staging: shadow mode for appeal_complaint to gather IR metrics
+  # without exposing IR failures to users.
+  appeal_complaint: shadow
+
+  # All other types follow the global ENABLE_DOCUMENT_IR_PIPELINE env var.
+  # Add overrides here as types graduate through the IR pipeline.

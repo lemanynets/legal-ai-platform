@@ -4,11 +4,29 @@ Pydantic schemas for the document intake / batch-analyze endpoints.
 This module is the canonical definition for request/response shapes used
 by the intake and batch-analyze routers.  The separate backend must import
 from (or replicate) these definitions in its own app/schemas/analyze.py.
+
+Wave 0: AnalyzeIntake, BatchProcess, ProcessualGate, ExportReadiness
+Wave 1: DocumentIR (see document_ir.py — imported here for re-export)
 """
 
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+# Re-export DocumentIR types for convenience
+from .document_ir import (  # noqa: F401  (re-exports)
+    AttachmentItem,
+    CitationItem,
+    ClaimItem,
+    DocumentHeader,
+    DocumentIR,
+    FactItem,
+    IRDocumentStatus,
+    Inconsistency,
+    LegalThesis,
+    PartyItem,
+    SignatureBlock,
+)
 
 # ---------------------------------------------------------------------------
 # STORY-0B — Processual severity enum

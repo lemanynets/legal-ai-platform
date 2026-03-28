@@ -20,6 +20,18 @@ from .schemas import (
     ProcessualGateCheckRequest,
     ProcessualGateCheckResponse,
     ReadinessCheckResult,
+    # Wave 1 — DocumentIR (re-exported from document_ir.py via schemas.py)
+    AttachmentItem,
+    CitationItem,
+    ClaimItem,
+    DocumentHeader,
+    DocumentIR,
+    FactItem,
+    IRDocumentStatus,
+    Inconsistency,
+    LegalThesis,
+    PartyItem,
+    SignatureBlock,
 )
 
 __all__ = [
@@ -36,4 +48,16 @@ __all__ = [
     # STORY-0C — export readiness
     "ReadinessCheckResult",
     "ExportReadinessResponse",
+    # STORY-1 — DocumentIR
+    "DocumentIR",
+    "DocumentHeader",
+    "PartyItem",
+    "FactItem",
+    "LegalThesis",
+    "ClaimItem",
+    "AttachmentItem",
+    "SignatureBlock",
+    "CitationItem",
+    "Inconsistency",
+    "IRDocumentStatus",
 ]

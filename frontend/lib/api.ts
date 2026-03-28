@@ -4561,3 +4561,127 @@ export async function checkExportReadiness(
     { token, demoUser }
   );
 }
+
+// ---------------------------------------------------------------------------
+// STORY-1 — DocumentIR TypeScript types
+// ---------------------------------------------------------------------------
+
+export type IRDocumentStatus = "draft" | "needs_review" | "final";
+export type IRSourceType = "case_law" | "statute" | "regulation" | "doctrine" | "other";
+export type IRGroundingStatus = "grounded" | "ungrounded" | "draft";
+
+export type IRCitationItem = {
+  id: string;
+  source_type: IRSourceType;
+  source_locator: string;
+  evidence_span: string;
+  decision_id?: string;
+  court_name?: string;
+  decision_date?: string;
+};
+
+export type IRDocumentHeader = {
+  title: string;
+  court_name?: string;
+  court_type?: string;
+  case_number?: string;
+  document_date?: string;
+  jurisdiction: string;
+};
+
+export type IRPartyItem = {
+  id: string;
+  role: string;
+  name: string;
+  identifier?: string;
+  address?: string;
+  representative?: string;
+};
+
+export type IRFactItem = {
+  id: string;
+  text: string;
+  date?: string;
+  supporting_evidence: string[];
+};
+
+export type IRLegalThesis = {
+  id: string;
+  text: string;
+  citations: string[];
+  grounding_status: IRGroundingStatus;
+  citation_coverage: number;
+};
+
+export type IRClaimItem = {
+  id: string;
+  text: string;
+  relief_type: string;
+  amount?: number;
+  currency?: string;
+  supporting_fact_ids: string[];
+  supporting_thesis_ids: string[];
+};
+
+export type IRAttachmentItem = {
+  id: string;
+  title: string;
+  required: boolean;
+  provided: boolean;
+};
+
+export type IRSignatureBlock = {
+  signer_name?: string;
+  signer_role?: string;
+  date_placeholder: boolean;
+};
+
+export type IRInconsistency = {
+  code: string;
+  description: string;
+  affected_sections: string[];
+};
+
+export type DocumentIR = {
+  id: string;
+  doc_id?: string;
+  document_type: string;
+  ir_version: string;
+  status: IRDocumentStatus;
+  header: IRDocumentHeader;
+  parties: IRPartyItem[];
+  facts: IRFactItem[];
+  legal_basis: IRLegalThesis[];
+  claims: IRClaimItem[];
+  attachments: IRAttachmentItem[];
+  signature_block?: IRSignatureBlock;
+  citations: IRCitationItem[];
+  inconsistencies: IRInconsistency[];
+  citation_coverage?: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/**
+ * Retrieve the DocumentIR for a generated document.
+ *
+ * Returns null when the document was created before Wave 1 (ir_json=NULL).
+ *
+ * GET /api/documents/{documentId}/ir
+ */
+export async function getDocumentIR(
+  documentId: string,
+  token?: string,
+  demoUser?: string
+): Promise<DocumentIR | null> {
+  try {
+    return await request<DocumentIR>(`/api/documents/${documentId}/ir`, {
+      token,
+      demoUser,
+      cache: "default",  // IR is immutable once status=final
+    });
+  } catch (err) {
+    if (err instanceof ApiClientError && err.status === 404) return null;
+    throw err;
+  }
+}

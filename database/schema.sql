@@ -56,8 +56,20 @@ CREATE TABLE IF NOT EXISTS generated_documents (
     court_fee_amount DECIMAL(10, 2),
     ai_model VARCHAR(100),
     tokens_used INT,
+    -- Wave 1 STORY-1: DocumentIR column (nullable, not breaking)
+    -- ir_json stores the DocumentIR as JSONB; NULL = legacy document (pre-Wave-1)
+    -- ir_status mirrors DocumentIR.status for fast filtering without JSONB extraction
+    ir_json JSONB DEFAULT NULL,
+    ir_status VARCHAR(20) DEFAULT NULL
+        CHECK (ir_status IN ('draft', 'needs_review', 'final')),
+    ir_version VARCHAR(10) DEFAULT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Index to quickly find documents by IR status (e.g. for QA review queue)
+CREATE INDEX IF NOT EXISTS idx_generated_documents_ir_status
+    ON generated_documents (ir_status)
+    WHERE ir_status IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
