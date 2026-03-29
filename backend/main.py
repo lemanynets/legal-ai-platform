@@ -11,18 +11,29 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+import asyncio
+import pathlib
+import time
+
+import httpx
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Base, engine, get_session
+
+# ── Upload directory (ephemeral but safe for single request lifecycle) ─────────
+UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", "/tmp/uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Legal AI Platform", version="1.0.0")
@@ -103,6 +114,62 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_generated_documents_user_id ON generated_documents(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_generated_documents_created_at ON generated_documents(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_cases_user_id ON cases(user_id)",
+    # ── AI Analyze tables ────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS contract_analyses (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        file_name TEXT,
+        file_url TEXT,
+        file_size BIGINT,
+        contract_type TEXT,
+        risk_level TEXT,
+        critical_risks JSONB NOT NULL DEFAULT '[]',
+        medium_risks JSONB NOT NULL DEFAULT '[]',
+        ok_points JSONB NOT NULL DEFAULT '[]',
+        recommendations JSONB NOT NULL DEFAULT '[]',
+        summary TEXT,
+        ai_model TEXT,
+        tokens_used INT,
+        processing_time_ms INT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_contract_analyses_user_id ON contract_analyses(user_id)",
+    """CREATE TABLE IF NOT EXISTS document_intakes (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        case_id UUID REFERENCES cases(id) ON DELETE SET NULL,
+        source_file_name TEXT,
+        classified_type TEXT NOT NULL DEFAULT 'unknown',
+        document_language TEXT,
+        jurisdiction TEXT NOT NULL DEFAULT 'UA',
+        primary_party_role TEXT,
+        identified_parties JSONB NOT NULL DEFAULT '[]',
+        subject_matter TEXT,
+        financial_exposure_amount NUMERIC,
+        financial_exposure_currency TEXT,
+        financial_exposure_type TEXT,
+        document_date TEXT,
+        deadline_from_document TEXT,
+        urgency_level TEXT,
+        risk_level_legal TEXT,
+        risk_level_procedural TEXT,
+        risk_level_financial TEXT,
+        detected_issues JSONB NOT NULL DEFAULT '[]',
+        classifier_confidence NUMERIC,
+        classifier_model TEXT,
+        raw_text_preview TEXT,
+        tags JSONB NOT NULL DEFAULT '[]',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_document_intakes_user_id ON document_intakes(user_id)",
+    """CREATE TABLE IF NOT EXISTS intake_comments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        intake_id UUID NOT NULL REFERENCES document_intakes(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_intake_comments_intake_id ON intake_comments(intake_id)",
 ]
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -1017,6 +1084,579 @@ async def calculate_full_claim(body: dict, current_user: dict = Depends(get_curr
 @app.get("/api/audit/history")
 async def get_audit_history(current_user: dict = Depends(get_current_user)):
     return {"items": [], "total": 0}
+
+
+# ============================================================================
+# AI ANALYZE  (/api/analyze/*)
+# ============================================================================
+
+def _subscription_usage(plan: str, docs_used: int, docs_limit: int | None) -> dict:
+    return {"docs_used": docs_used, "docs_limit": docs_limit}
+
+
+async def _get_usage(session: AsyncSession, user_id: str) -> dict:
+    row = (
+        await session.execute(
+            text("SELECT plan, docs_used, docs_limit FROM subscriptions WHERE user_id = :uid LIMIT 1"),
+            {"uid": user_id},
+        )
+    ).mappings().first()
+    if not row:
+        return {"docs_used": 0, "docs_limit": 5}
+    return _subscription_usage(row["plan"], row["docs_used"], row["docs_limit"])
+
+
+async def _run_ai_intake(
+    file_bytes: bytes,
+    file_name: str,
+    jurisdiction: str,
+    mode: str,
+    api_key: str | None,
+) -> dict:
+    """Call Anthropic API for deep document intake analysis."""
+    if not api_key:
+        return _demo_intake(file_name, jurisdiction)
+
+    try:
+        import anthropic  # noqa: PLC0415
+
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        text_preview = file_bytes.decode("utf-8", errors="replace")[:10000]
+        max_tokens = 4096 if mode == "deep" else 2048
+
+        prompt = f"""Ти — юридичний аналітик. Проаналізуй такий документ і поверни ТІЛЬКИ валідний JSON без markdown та додаткового тексту.
+
+Документ (перші символи):
+{text_preview}
+
+Поверни JSON з такими полями:
+{{
+  "classified_type": "рядок (договір/позов/рішення/судовий наказ/інше)",
+  "document_language": "uk або en або інше",
+  "primary_party_role": "позивач/відповідач/кредитор/боржник/інше або null",
+  "identified_parties": [{{"role": "...", "name": "..."}}],
+  "subject_matter": "короткий опис предмету (1-2 речення)",
+  "financial_exposure_amount": число або null,
+  "financial_exposure_currency": "UAH/USD/EUR або null",
+  "financial_exposure_type": "борг/штраф/компенсація або null",
+  "document_date": "YYYY-MM-DD або null",
+  "deadline_from_document": "YYYY-MM-DD або null",
+  "urgency_level": "low/medium/high/critical",
+  "risk_level_legal": "low/medium/high/critical",
+  "risk_level_procedural": "low/medium/high/critical",
+  "risk_level_financial": "low/medium/high/critical",
+  "detected_issues": [
+    {{"issue_type": "...", "severity": "low/medium/high/critical", "description": "...", "impact": "..."}}
+  ],
+  "classifier_confidence": число від 0 до 1,
+  "tags": ["рядок", ...]
+}}"""
+
+        message = await client.messages.create(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[analyze] AI error: {e}")
+        return _demo_intake(file_name, jurisdiction)
+
+
+def _demo_intake(file_name: str, jurisdiction: str) -> dict:
+    return {
+        "classified_type": "контракт",
+        "document_language": "uk",
+        "primary_party_role": None,
+        "identified_parties": [],
+        "subject_matter": f"[Demo] Файл: {file_name}. Налаштуйте ANTHROPIC_API_KEY для реального аналізу.",
+        "financial_exposure_amount": None,
+        "financial_exposure_currency": None,
+        "financial_exposure_type": None,
+        "document_date": None,
+        "deadline_from_document": None,
+        "urgency_level": "medium",
+        "risk_level_legal": "medium",
+        "risk_level_procedural": "low",
+        "risk_level_financial": "low",
+        "detected_issues": [
+            {
+                "issue_type": "demo",
+                "severity": "low",
+                "description": "Demo режим — API ключ не налаштовано",
+                "impact": "Додайте ANTHROPIC_API_KEY у змінні оточення Railway",
+            }
+        ],
+        "classifier_confidence": 0.0,
+        "tags": ["demo"],
+    }
+
+
+def _intake_row_to_dict(row: Any, usage: dict) -> dict:
+    r = dict(row)
+    for field in ("identified_parties", "detected_issues", "tags"):
+        if isinstance(r.get(field), str):
+            try:
+                r[field] = json.loads(r[field])
+            except Exception:
+                r[field] = []
+    r["usage"] = usage
+    r["cache_hit"] = False
+    return r
+
+
+@app.post("/api/analyze/intake")
+async def analyze_intake(
+    file: UploadFile = File(...),
+    jurisdiction: str = Form("UA"),
+    case_id: str = Form(None),
+    mode: str = Query("standard"),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    t0 = time.monotonic()
+    uid = str(current_user["id"])
+
+    # Read file bytes (no disk write needed — ephemeral containers)
+    try:
+        file_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати файл: {e}")
+
+    file_name = file.filename or "document"
+    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+    ai_result = await _run_ai_intake(file_bytes, file_name, jurisdiction, mode, api_key)
+
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    rid = str(uuid.uuid4())
+
+    await session.execute(
+        text("""
+            INSERT INTO document_intakes (
+                id, user_id, case_id, source_file_name,
+                classified_type, document_language, jurisdiction,
+                primary_party_role, identified_parties, subject_matter,
+                financial_exposure_amount, financial_exposure_currency, financial_exposure_type,
+                document_date, deadline_from_document, urgency_level,
+                risk_level_legal, risk_level_procedural, risk_level_financial,
+                detected_issues, classifier_confidence, classifier_model,
+                raw_text_preview, tags
+            ) VALUES (
+                :id, :uid, :case_id, :fname,
+                :ctype, :lang, :jur,
+                :role, :parties::jsonb, :subject,
+                :amount, :currency, :exp_type,
+                :doc_date, :deadline, :urgency,
+                :rl_legal, :rl_proc, :rl_fin,
+                :issues::jsonb, :conf, :model,
+                :preview, :tags::jsonb
+            )
+        """),
+        {
+            "id": rid,
+            "uid": uid,
+            "case_id": case_id or None,
+            "fname": file_name,
+            "ctype": ai_result.get("classified_type", "unknown"),
+            "lang": ai_result.get("document_language"),
+            "jur": jurisdiction,
+            "role": ai_result.get("primary_party_role"),
+            "parties": json.dumps(ai_result.get("identified_parties", []), ensure_ascii=False),
+            "subject": ai_result.get("subject_matter"),
+            "amount": ai_result.get("financial_exposure_amount"),
+            "currency": ai_result.get("financial_exposure_currency"),
+            "exp_type": ai_result.get("financial_exposure_type"),
+            "doc_date": ai_result.get("document_date"),
+            "deadline": ai_result.get("deadline_from_document"),
+            "urgency": ai_result.get("urgency_level", "medium"),
+            "rl_legal": ai_result.get("risk_level_legal", "medium"),
+            "rl_proc": ai_result.get("risk_level_procedural", "low"),
+            "rl_fin": ai_result.get("risk_level_financial", "low"),
+            "issues": json.dumps(ai_result.get("detected_issues", []), ensure_ascii=False),
+            "conf": ai_result.get("classifier_confidence"),
+            "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6") if api_key else "demo",
+            "preview": file_bytes.decode("utf-8", errors="replace")[:500],
+            "tags": json.dumps(ai_result.get("tags", []), ensure_ascii=False),
+        },
+    )
+    await session.commit()
+
+    usage = await _get_usage(session, uid)
+    row = (
+        await session.execute(
+            text("SELECT * FROM document_intakes WHERE id = :id LIMIT 1"), {"id": rid}
+        )
+    ).mappings().first()
+    return _intake_row_to_dict(row, usage)
+
+
+@app.post("/api/analyze/intake-stream")
+async def analyze_intake_stream(
+    file: UploadFile = File(...),
+    jurisdiction: str = Form("UA"),
+    case_id: str = Form(None),
+    mode: str = Query("standard"),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """SSE streaming wrapper — runs intake and emits one `result` event."""
+    file_bytes = await file.read()
+    file_name = file.filename or "document"
+    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
+    uid = str(current_user["id"])
+
+    async def event_stream():
+        yield "data: " + json.dumps({"event": "start", "message": "Аналіз розпочато…"}) + "\n\n"
+        await asyncio.sleep(0)
+
+        ai_result = await _run_ai_intake(file_bytes, file_name, jurisdiction, mode, api_key)
+        rid = str(uuid.uuid4())
+
+        try:
+            await session.execute(
+                text("""
+                    INSERT INTO document_intakes (
+                        id, user_id, case_id, source_file_name,
+                        classified_type, document_language, jurisdiction,
+                        primary_party_role, identified_parties, subject_matter,
+                        financial_exposure_amount, financial_exposure_currency, financial_exposure_type,
+                        document_date, deadline_from_document, urgency_level,
+                        risk_level_legal, risk_level_procedural, risk_level_financial,
+                        detected_issues, classifier_confidence, classifier_model,
+                        raw_text_preview, tags
+                    ) VALUES (
+                        :id, :uid, :case_id, :fname,
+                        :ctype, :lang, :jur,
+                        :role, :parties::jsonb, :subject,
+                        :amount, :currency, :exp_type,
+                        :doc_date, :deadline, :urgency,
+                        :rl_legal, :rl_proc, :rl_fin,
+                        :issues::jsonb, :conf, :model,
+                        :preview, :tags::jsonb
+                    )
+                """),
+                {
+                    "id": rid, "uid": uid, "case_id": case_id or None, "fname": file_name,
+                    "ctype": ai_result.get("classified_type", "unknown"),
+                    "lang": ai_result.get("document_language"), "jur": jurisdiction,
+                    "role": ai_result.get("primary_party_role"),
+                    "parties": json.dumps(ai_result.get("identified_parties", []), ensure_ascii=False),
+                    "subject": ai_result.get("subject_matter"),
+                    "amount": ai_result.get("financial_exposure_amount"),
+                    "currency": ai_result.get("financial_exposure_currency"),
+                    "exp_type": ai_result.get("financial_exposure_type"),
+                    "doc_date": ai_result.get("document_date"),
+                    "deadline": ai_result.get("deadline_from_document"),
+                    "urgency": ai_result.get("urgency_level", "medium"),
+                    "rl_legal": ai_result.get("risk_level_legal", "medium"),
+                    "rl_proc": ai_result.get("risk_level_procedural", "low"),
+                    "rl_fin": ai_result.get("risk_level_financial", "low"),
+                    "issues": json.dumps(ai_result.get("detected_issues", []), ensure_ascii=False),
+                    "conf": ai_result.get("classifier_confidence"),
+                    "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6") if api_key else "demo",
+                    "preview": file_bytes.decode("utf-8", errors="replace")[:500],
+                    "tags": json.dumps(ai_result.get("tags", []), ensure_ascii=False),
+                },
+            )
+            await session.commit()
+        except Exception as e:
+            print(f"[intake-stream] DB error: {e}")
+
+        usage = await _get_usage(session, uid)
+        row = (await session.execute(
+            text("SELECT * FROM document_intakes WHERE id = :id LIMIT 1"), {"id": rid}
+        )).mappings().first()
+        result = _intake_row_to_dict(row, usage) if row else {"id": rid, "usage": usage}
+        yield "data: " + json.dumps({"event": "result", "result": result}) + "\n\n"
+        yield "data: " + json.dumps({"event": "done"}) + "\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/api/analyze/history")
+async def get_analyze_history(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    rows = (
+        await session.execute(
+            text("SELECT * FROM contract_analyses WHERE user_id = :uid ORDER BY created_at DESC LIMIT 50"),
+            {"uid": uid},
+        )
+    ).mappings().all()
+    usage = await _get_usage(session, uid)
+    items = []
+    for r in rows:
+        d = dict(r)
+        for f in ("critical_risks", "medium_risks", "ok_points", "recommendations"):
+            if isinstance(d.get(f), str):
+                try:
+                    d[f] = json.loads(d[f])
+                except Exception:
+                    d[f] = []
+        d["usage"] = usage
+        items.append(d)
+    return {"total": len(items), "items": items, "usage": usage}
+
+
+@app.post("/api/analyze/process")
+async def process_contract_analysis(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    t0 = time.monotonic()
+    contract_text = body.get("contract_text", "")
+    file_name = body.get("file_name", "document.txt")
+    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+    from app.services.intake_analyzer import run_intake_analysis  # noqa: PLC0415
+    result = await run_intake_analysis(
+        contract_text.encode("utf-8"),
+        file_name,
+        body.get("mode"),
+    )
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    rid = str(uuid.uuid4())
+    await session.execute(
+        text("""
+            INSERT INTO contract_analyses (
+                id, user_id, file_name, file_url, file_size,
+                risk_level, critical_risks, medium_risks, ok_points,
+                recommendations, summary, ai_model, tokens_used, processing_time_ms
+            ) VALUES (
+                :id, :uid, :fname, :furl, :fsize,
+                :rl, :cr::jsonb, :mr::jsonb, :ok::jsonb,
+                :rec::jsonb, :summary, :model, :tokens, :ms
+            )
+        """),
+        {
+            "id": rid, "uid": uid, "fname": file_name,
+            "furl": body.get("file_url"), "fsize": body.get("file_size"),
+            "rl": result.get("risk_level", "medium"),
+            "cr": json.dumps(result.get("critical_risks", []), ensure_ascii=False),
+            "mr": json.dumps(result.get("medium_risks", []), ensure_ascii=False),
+            "ok": json.dumps(result.get("ok_points", []), ensure_ascii=False),
+            "rec": json.dumps(result.get("recommendations", []), ensure_ascii=False),
+            "summary": result.get("summary"),
+            "model": result.get("ai_model", "demo"),
+            "tokens": result.get("tokens_used", 0),
+            "ms": elapsed_ms,
+        },
+    )
+    await session.commit()
+    usage = await _get_usage(session, uid)
+    return {
+        "id": rid,
+        "user_id": uid,
+        "file_name": file_name,
+        "file_url": body.get("file_url"),
+        "file_size": body.get("file_size"),
+        "contract_type": None,
+        "risk_level": result.get("risk_level", "medium"),
+        "critical_risks": result.get("critical_risks", []),
+        "medium_risks": result.get("medium_risks", []),
+        "ok_points": result.get("ok_points", []),
+        "recommendations": result.get("recommendations", []),
+        "summary": result.get("summary"),
+        "ai_model": result.get("ai_model", "demo"),
+        "tokens_used": result.get("tokens_used", 0),
+        "processing_time_ms": elapsed_ms,
+        "tags": [],
+        "created_at": datetime.utcnow().isoformat(),
+        "usage": usage,
+    }
+
+
+@app.get("/api/analyze/{analysis_id}")
+async def get_analysis(
+    analysis_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    usage = await _get_usage(session, uid)
+
+    # Try document_intakes first
+    row = (
+        await session.execute(
+            text("SELECT * FROM document_intakes WHERE id = :id AND user_id = :uid LIMIT 1"),
+            {"id": analysis_id, "uid": uid},
+        )
+    ).mappings().first()
+    if row:
+        return _intake_row_to_dict(row, usage)
+
+    # Fallback to contract_analyses
+    row = (
+        await session.execute(
+            text("SELECT * FROM contract_analyses WHERE id = :id AND user_id = :uid LIMIT 1"),
+            {"id": analysis_id, "uid": uid},
+        )
+    ).mappings().first()
+    if row:
+        d = dict(row)
+        d["usage"] = usage
+        return d
+
+    raise HTTPException(status_code=404, detail="Аналіз не знайдено")
+
+
+@app.patch("/api/analyze/{analysis_id}")
+async def update_analysis(
+    analysis_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    allowed = {"classified_type", "subject_matter", "urgency_level", "risk_level_legal",
+                "risk_level_procedural", "risk_level_financial", "tags"}
+    fields = {k: v for k, v in body.items() if k in allowed and v is not None}
+    if fields:
+        sets = ", ".join(f"{k} = :{k}" for k in fields)
+        if "tags" in fields:
+            fields["tags"] = json.dumps(fields["tags"], ensure_ascii=False)
+            sets = sets.replace("tags = :tags", "tags = :tags::jsonb")
+        fields.update({"id": analysis_id, "uid": uid})
+        await session.execute(
+            text(f"UPDATE document_intakes SET {sets} WHERE id = :id AND user_id = :uid"),
+            fields,
+        )
+        await session.commit()
+    return {"status": "ok"}
+
+
+@app.post("/api/analyze/gdpr-check")
+async def gdpr_check(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    text_content = body.get("text", "")
+    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        return {
+            "report": "[Demo] GDPR-перевірка потребує ANTHROPIC_API_KEY",
+            "compliant": True,
+            "issues": [],
+            "personal_data_found": [],
+            "recommendations": ["Налаштуйте ANTHROPIC_API_KEY у Railway"],
+        }
+
+    try:
+        import anthropic  # noqa: PLC0415
+        client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        prompt = (
+            f"Проаналізуй текст на GDPR-відповідність і поверни JSON:\n"
+            f"{{'compliant': bool, 'report': '...', 'issues': [...], "
+            f"'personal_data_found': [{{'type': '...', 'count': N}}], "
+            f"'recommendations': [...]}}\n\nТекст:\n{text_content[:5000]}"
+        )
+        msg = await client.messages.create(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        return {
+            "report": f"Помилка аналізу: {e}",
+            "compliant": True,
+            "issues": [],
+            "personal_data_found": [],
+            "recommendations": [],
+        }
+
+
+@app.get("/api/analyze/{intake_id}/comments")
+async def get_intake_comments(
+    intake_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    rows = (
+        await session.execute(
+            text("""
+                SELECT c.id, c.intake_id, c.user_id, u.full_name as user_name, c.content, c.created_at
+                FROM intake_comments c
+                LEFT JOIN users u ON u.id = c.user_id
+                WHERE c.intake_id = :iid
+                ORDER BY c.created_at ASC
+            """),
+            {"iid": intake_id},
+        )
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/analyze/{intake_id}/comments")
+async def create_intake_comment(
+    intake_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    cid = str(uuid.uuid4())
+    content = body.get("content", "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Порожній коментар")
+    await session.execute(
+        text("INSERT INTO intake_comments (id, intake_id, user_id, content) VALUES (:id, :iid, :uid, :content)"),
+        {"id": cid, "iid": intake_id, "uid": uid, "content": content},
+    )
+    await session.commit()
+    return {
+        "id": cid,
+        "intake_id": intake_id,
+        "user_id": uid,
+        "user_name": current_user.get("full_name"),
+        "content": content,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.delete("/api/analyze/{intake_id}/comments/{comment_id}")
+async def delete_intake_comment(
+    intake_id: str,
+    comment_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    await session.execute(
+        text("DELETE FROM intake_comments WHERE id = :cid AND intake_id = :iid AND user_id = :uid"),
+        {"cid": comment_id, "iid": intake_id, "uid": uid},
+    )
+    await session.commit()
+    return {"status": "ok"}
+
+
+@app.post("/api/analyze/{intake_id}/precedent-map")
+async def create_precedent_map(
+    intake_id: str,
+    limit: int = Query(10),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    # Stub — returns empty map (real precedent search requires vector DB)
+    return {
+        "intake_id": intake_id,
+        "query_used": "",
+        "groups": [],
+        "refs": [],
+    }
 
 
 # ── OpenDataBot proxy ─────────────────────────────────────────────────────────
