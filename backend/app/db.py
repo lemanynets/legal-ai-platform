@@ -12,11 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 
 
+_DEFAULT_URL = "postgresql+asyncpg://legal_ai:secret@db:5432/legal_ai"
+
+
 def _build_database_url() -> str:
-    url = os.environ.get(
-        "DATABASE_URL",
-        "postgresql+asyncpg://legal_ai:secret@db:5432/legal_ai",
-    )
+    url = os.environ.get("DATABASE_URL", "").strip() or _DEFAULT_URL
     # Normalise scheme: postgres:// → postgresql+asyncpg://
     url = url.replace("postgres://", "postgresql://", 1)
     url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
