@@ -1019,6 +1019,61 @@ async def get_audit_history(current_user: dict = Depends(get_current_user)):
     return {"items": [], "total": 0}
 
 
+# ── OpenDataBot proxy ─────────────────────────────────────────────────────────
+
+_ODB_KEY = os.getenv("OPENDATABOT_API_KEY", "")
+_ODB_BASE = "https://api.opendatabot.ua"
+
+
+async def _odb_get(path: str, params: dict | None = None) -> Any:
+    """Proxy a GET request to OpenDataBot API."""
+    if not _ODB_KEY:
+        raise HTTPException(status_code=503, detail="OPENDATABOT_API_KEY не налаштований")
+    headers = {"apikey": _ODB_KEY}
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(f"{_ODB_BASE}{path}", params=params, headers=headers)
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Справу не знайдено в OpenDataBot")
+    if resp.status_code == 402:
+        raise HTTPException(status_code=402, detail="Ліміт запитів OpenDataBot вичерпано")
+    if not resp.is_success:
+        raise HTTPException(status_code=resp.status_code, detail=f"OpenDataBot error: {resp.text[:200]}")
+    return resp.json()
+
+
+@app.get("/api/opendatabot/court-cases/{case_number}")
+async def get_court_case(
+    case_number: str,
+    judgment_code: int | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
+    params: dict = {"number": case_number}
+    if judgment_code:
+        params["judgment_code"] = judgment_code
+    data = await _odb_get("/v1/court/case", params=params)
+    return data
+
+
+@app.get("/api/opendatabot/usage")
+async def get_opendatabot_usage(current_user: dict = Depends(get_current_user)):
+    if not _ODB_KEY:
+        return {"limit": 0, "used": 0, "remaining": 0, "expires_at": None, "api_url": _ODB_BASE}
+    data = await _odb_get("/v1/account/usage")
+    return {
+        "limit": data.get("limit", 0),
+        "used": data.get("used", 0),
+        "remaining": data.get("remaining", 0),
+        "expires_at": data.get("expires_at"),
+        "api_url": _ODB_BASE,
+    }
+
+
+@app.get("/api/opendatabot/company/{code}")
+async def get_company(code: str, current_user: dict = Depends(get_current_user)):
+    data = await _odb_get(f"/v1/company/{code}")
+    return data
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
