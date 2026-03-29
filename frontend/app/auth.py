@@ -32,11 +32,14 @@ import json as _json
 _SECRET = os.getenv("SECRET_KEY", "dev-secret-change-me")
 
 def _make_token(user_id: str, email: str) -> str:
-    """Simple signed token: base64(payload).base64(hmac) — avoids jose/cryptography conflicts."""
+    """3-part signed token: header.payload.sig — JWT-compatible structure."""
     import hmac as _hmac
-    payload = _json.dumps({"sub": user_id, "email": email}).encode()
-    sig = _hmac.new(_SECRET.encode(), payload, _hl.sha256).hexdigest()
-    return _b64.urlsafe_b64encode(payload).decode() + "." + sig
+    header = _b64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+    payload_json = _json.dumps({"sub": user_id, "email": email})
+    payload = _b64.urlsafe_b64encode(payload_json.encode()).decode().rstrip("=")
+    signing_input = f"{header}.{payload}".encode()
+    sig = _hmac.new(_SECRET.encode(), signing_input, _hl.sha256).hexdigest()
+    return f"{header}.{payload}.{sig}"
 
 router = APIRouter()
 
