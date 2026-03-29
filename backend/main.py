@@ -180,8 +180,20 @@ async def get_current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    if ALLOW_DEV_AUTH and (creds is None or creds.credentials in ("dev-token", "")):
-        return await _get_or_create_user(session, "dev@legal-ai.local", "Dev User")
+    token_str = creds.credentials if creds else ""
+
+    # Dev-mode: accept legacy offline tokens (dev-token, dev-token-<slug>)
+    if ALLOW_DEV_AUTH and (not token_str or token_str.startswith("dev-token")):
+        if token_str.startswith("dev-token-"):
+            slug = token_str[len("dev-token-"):]          # e.g. "dev-john"
+            # strip leading "dev-" prefix that frontend adds
+            slug = slug[4:] if slug.startswith("dev-") else slug
+            email = f"{slug}@dev.local"
+            name = slug.split("-")[0].capitalize()
+        else:
+            email = "dev@legal-ai.local"
+            name = "Dev User"
+        return await _get_or_create_user(session, email, name)
 
     if creds is None:
         raise HTTPException(status_code=401, detail="Missing token")

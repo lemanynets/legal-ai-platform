@@ -209,48 +209,55 @@ export function getUserId(): string {
   return hydrateCachedSession()?.user_id ?? "demo-user";
 }
 
-export async function login(email: string, password: string): Promise<UserSession> {
-  // When Supabase is not configured, always use devLogin (works offline, no backend needed)
-  if (isDevAuthEnabled) {
-    return devLogin(email, password);
-  }
+/** True when BACKEND_URL points to a real remote server (not localhost). */
+function hasProductionBackend(): boolean {
+  return (
+    !!BACKEND_URL &&
+    !BACKEND_URL.includes("localhost") &&
+    !BACKEND_URL.includes("127.0.0.1") &&
+    BACKEND_URL !== "http://backend:8000"
+  );
+}
 
+function safeDecodeTokenPayload(token: string): Record<string, unknown> {
+  try {
+    return decodeTokenPayload(token);
+  } catch {
+    return {};
+  }
+}
+
+async function _backendLogin(email: string, password: string): Promise<UserSession> {
   const data = await performAuthRequest(
     "/api/auth/login",
     { email, password },
     "Не вдалося увійти. Перевірте email і пароль.",
   );
   const token = data.access_token;
-  const payload = decodeTokenPayload(token);
+  const payload = safeDecodeTokenPayload(token);
   const userId =
     String(payload.sub || "").trim() || email.split("@")[0].replace(/[^a-z0-9]/gi, "-");
 
   const session = buildSession({
     userId,
     email,
-    name: String(payload.full_name || email.split("@")[0]),
+    name: String(payload.full_name || payload.email || email.split("@")[0]),
     token,
     fallbackPlan: "PRO",
   });
-
   cachedSession = session;
   persistSession(session);
   return session;
 }
 
-export async function registerUser(email: string, password: string, fullName?: string): Promise<UserSession> {
-  // Dev mode: treat register same as login
-  if (isDevAuthEnabled) {
-    return devLogin(email || "dev@legal-ai.local", password || "dev");
-  }
-
+async function _backendRegister(email: string, password: string, fullName?: string): Promise<UserSession> {
   const data = await performAuthRequest(
     "/api/auth/register",
     { email, password, full_name: fullName },
     "Не вдалося зареєструватися. Перевірте дані та спробуйте ще раз.",
   );
   const token = data.access_token;
-  const payload = decodeTokenPayload(token);
+  const payload = safeDecodeTokenPayload(token);
   const userId =
     String(payload.sub || "").trim() || email.split("@")[0].replace(/[^a-z0-9]/gi, "-");
 
@@ -261,10 +268,49 @@ export async function registerUser(email: string, password: string, fullName?: s
     token,
     fallbackPlan: "PRO",
   });
-
   cachedSession = session;
   persistSession(session);
   return session;
+}
+
+export async function login(email: string, password: string): Promise<UserSession> {
+  // Always use real backend when a production URL is configured.
+  if (hasProductionBackend()) {
+    try {
+      return await _backendLogin(email, password);
+    } catch (e) {
+      // If backend is unreachable AND dev mode is enabled, fall back offline.
+      if (isDevAuthEnabled && (e instanceof Error) && e.message.includes("з'єднатися")) {
+        return devLogin(email, password);
+      }
+      throw e;
+    }
+  }
+
+  if (!isDevAuthEnabled) {
+    return _backendLogin(email, password);
+  }
+
+  return devLogin(email, password);
+}
+
+export async function registerUser(email: string, password: string, fullName?: string): Promise<UserSession> {
+  if (hasProductionBackend()) {
+    try {
+      return await _backendRegister(email, password, fullName);
+    } catch (e) {
+      if (isDevAuthEnabled && (e instanceof Error) && e.message.includes("з'єднатися")) {
+        return devLogin(email || "dev@legal-ai.local", password || "dev");
+      }
+      throw e;
+    }
+  }
+
+  if (!isDevAuthEnabled) {
+    return _backendRegister(email, password, fullName);
+  }
+
+  return devLogin(email || "dev@legal-ai.local", password || "dev");
 }
 
 export async function devLogin(email: string, password: string): Promise<UserSession> {
