@@ -181,6 +181,130 @@ _MIGRATIONS = [
         updated_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_entries_user_id ON knowledge_entries(user_id)",
+    # ── Deadlines ────────────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS deadlines (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        case_id UUID REFERENCES cases(id) ON DELETE SET NULL,
+        document_id UUID REFERENCES generated_documents(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        deadline_type TEXT,
+        start_date TIMESTAMPTZ,
+        end_date TIMESTAMPTZ,
+        reminder_sent BOOLEAN NOT NULL DEFAULT false,
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_deadlines_user_id ON deadlines(user_id)",
+    # ── Case Law ─────────────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS case_law_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        source TEXT NOT NULL DEFAULT 'manual',
+        decision_id TEXT,
+        case_number TEXT,
+        court_name TEXT,
+        judge_name TEXT,
+        decision_date DATE,
+        doc_type TEXT,
+        summary TEXT,
+        full_text TEXT,
+        relevance_score NUMERIC,
+        tags JSONB NOT NULL DEFAULT '[]',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_case_law_user_id ON case_law_items(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_case_law_decision_date ON case_law_items(decision_date DESC)",
+    """CREATE TABLE IF NOT EXISTS case_law_digest (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL DEFAULT 'Дайджест',
+        summary TEXT,
+        source TEXT DEFAULT 'ai',
+        query TEXT,
+        items_count INT NOT NULL DEFAULT 0,
+        tags JSONB NOT NULL DEFAULT '[]',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_case_law_digest_user_id ON case_law_digest(user_id)",
+    # ── Calculations ─────────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS calculations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        calculation_type TEXT NOT NULL DEFAULT 'full_claim',
+        title TEXT,
+        input_payload JSONB NOT NULL DEFAULT '{}',
+        output_payload JSONB NOT NULL DEFAULT '{}',
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_calculations_user_id ON calculations(user_id)",
+    # ── Audit Logs ───────────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        action TEXT NOT NULL,
+        entity_type TEXT,
+        entity_id TEXT,
+        metadata JSONB NOT NULL DEFAULT '{}',
+        integrity_scope TEXT,
+        integrity_prev_hash TEXT,
+        integrity_hash TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)",
+    # ── Registry Watch ───────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS registry_watch_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        source TEXT NOT NULL DEFAULT 'opendatabot',
+        registry_type TEXT NOT NULL DEFAULT 'company',
+        identifier TEXT NOT NULL,
+        entity_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        check_interval_hours INT NOT NULL DEFAULT 24,
+        last_checked_at TIMESTAMPTZ,
+        next_check_at TIMESTAMPTZ,
+        last_change_at TIMESTAMPTZ,
+        latest_snapshot JSONB,
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_registry_watch_user_id ON registry_watch_items(user_id)",
+    """CREATE TABLE IF NOT EXISTS registry_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        watch_item_id UUID REFERENCES registry_watch_items(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'info',
+        title TEXT NOT NULL,
+        details JSONB NOT NULL DEFAULT '{}',
+        observed_at TIMESTAMPTZ DEFAULT NOW(),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_registry_events_user_id ON registry_events(user_id)",
+    # ── Forum ─────────────────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS forum_posts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        case_id UUID REFERENCES cases(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        category TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_forum_posts_user_id ON forum_posts(user_id)",
+    """CREATE TABLE IF NOT EXISTS forum_comments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        post_id UUID NOT NULL REFERENCES forum_posts(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_forum_comments_post_id ON forum_comments(post_id)",
 ]
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -1038,63 +1162,658 @@ async def get_invoices(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/api/team/users")
-async def get_team_users(current_user: dict = Depends(get_current_user)):
-    return {"items": [{"id": str(current_user["id"]), "email": current_user["email"], "role": current_user.get("role", "user")}]}
+async def get_team_users(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    rows = (await session.execute(
+        text("SELECT id, email, full_name, role, company FROM users WHERE id = :uid OR role IN ('admin','owner') LIMIT 50"),
+        {"uid": uid},
+    )).mappings().all()
+    return {"items": [dict(r) for r in rows]}
 
+
+# ============================================================================
+# DEADLINES — повний CRUD з БД
+# ============================================================================
 
 @app.get("/api/deadlines")
-async def get_deadlines(current_user: dict = Depends(get_current_user)):
-    return {"items": []}
+async def get_deadlines(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    rows = (await session.execute(
+        text("SELECT * FROM deadlines WHERE user_id = :uid ORDER BY end_date ASC NULLS LAST, created_at DESC LIMIT 200"),
+        {"uid": uid},
+    )).mappings().all()
+    return {"total": len(rows), "items": [dict(r) for r in rows]}
 
 
-@app.post("/api/deadlines")
-async def create_deadline(body: dict, current_user: dict = Depends(get_current_user)):
-    return {"id": str(uuid.uuid4()), **body, "user_id": str(current_user["id"]), "created_at": datetime.utcnow().isoformat()}
+@app.post("/api/deadlines", status_code=201)
+async def create_deadline(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    did = str(uuid.uuid4())
+    await session.execute(
+        text("""
+            INSERT INTO deadlines (id, user_id, case_id, document_id, title, deadline_type,
+                start_date, end_date, reminder_sent, notes)
+            VALUES (:id, :uid, :case_id, :doc_id, :title, :dtype,
+                :start, :end, false, :notes)
+        """),
+        {
+            "id": did, "uid": uid,
+            "case_id": body.get("case_id"),
+            "doc_id": body.get("document_id"),
+            "title": body.get("title", "Строк"),
+            "dtype": body.get("deadline_type"),
+            "start": body.get("start_date"),
+            "end": body.get("end_date"),
+            "notes": body.get("notes"),
+        },
+    )
+    await session.commit()
+    row = (await session.execute(
+        text("SELECT * FROM deadlines WHERE id = :id LIMIT 1"), {"id": did}
+    )).mappings().first()
+    return dict(row) if row else {"id": did, "user_id": uid, **body}
 
+
+@app.patch("/api/deadlines/{deadline_id}")
+async def update_deadline(
+    deadline_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    allowed = {"title", "deadline_type", "start_date", "end_date", "notes", "reminder_sent"}
+    fields = {k: v for k, v in body.items() if k in allowed}
+    if fields:
+        sets = ", ".join(f"{k} = :{k}" for k in fields)
+        fields.update({"id": deadline_id, "uid": uid})
+        await session.execute(
+            text(f"UPDATE deadlines SET {sets} WHERE id = :id AND user_id = :uid"), fields
+        )
+        await session.commit()
+    return {"status": "ok"}
+
+
+@app.delete("/api/deadlines/{deadline_id}")
+async def delete_deadline(
+    deadline_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    await session.execute(
+        text("DELETE FROM deadlines WHERE id = :id AND user_id = :uid"),
+        {"id": deadline_id, "uid": uid},
+    )
+    await session.commit()
+    return {"status": "ok"}
+
+
+# ============================================================================
+# CASE-LAW — пошук в локальній БД + OpenDataBot
+# ============================================================================
 
 @app.get("/api/case-law/search")
-async def search_case_law(q: str = Query(""), current_user: dict = Depends(get_current_user)):
-    return {"items": [], "total": 0, "query": q}
+async def search_case_law(
+    q: str = Query(""),
+    court_form: str | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    sort_by: str = Query("decision_date"),
+    sort_dir: str = Query("desc"),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    conditions = ["user_id = :uid"]
+    params: dict = {"uid": uid}
+    if q.strip():
+        conditions.append("(summary ILIKE :q OR case_number ILIKE :q OR court_name ILIKE :q)")
+        params["q"] = f"%{q.strip()}%"
+    if date_from:
+        conditions.append("decision_date >= :date_from")
+        params["date_from"] = date_from
+    if date_to:
+        conditions.append("decision_date <= :date_to")
+        params["date_to"] = date_to
+    where = " AND ".join(conditions)
+    safe_sort = sort_by if sort_by in ("decision_date", "created_at", "relevance_score") else "decision_date"
+    safe_dir = "DESC" if sort_dir == "desc" else "ASC"
+    count_row = (await session.execute(
+        text(f"SELECT COUNT(*) FROM case_law_items WHERE {where}"), params
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text(f"SELECT * FROM case_law_items WHERE {where} ORDER BY {safe_sort} {safe_dir} LIMIT :lim OFFSET :off"),
+        {**params, "lim": page_size, "off": offset},
+    )).mappings().all()
+    return {
+        "total": count_row, "page": page, "page_size": page_size,
+        "pages": max(1, -(-int(count_row) // page_size)),
+        "sort_by": sort_by, "sort_dir": sort_dir,
+        "items": [dict(r) for r in rows],
+    }
 
 
 @app.get("/api/case-law/digest")
-async def get_case_law_digest(current_user: dict = Depends(get_current_user)):
-    return {"items": []}
+async def get_case_law_digest(
+    q: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    params: dict = {"uid": uid}
+    conditions = ["user_id = :uid"]
+    if q:
+        conditions.append("(title ILIKE :q OR summary ILIKE :q)")
+        params["q"] = f"%{q}%"
+    where = " AND ".join(conditions)
+    count_row = (await session.execute(
+        text(f"SELECT COUNT(*) FROM case_law_digest WHERE {where}"), params
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text(f"SELECT * FROM case_law_digest WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+        {**params, "lim": page_size, "off": offset},
+    )).mappings().all()
+    return {
+        "total": count_row, "page": page, "page_size": page_size,
+        "pages": max(1, -(-int(count_row) // page_size)),
+        "items": [dict(r) for r in rows],
+    }
 
+
+@app.get("/api/case-law/digest/history")
+async def get_digest_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    count_row = (await session.execute(
+        text("SELECT COUNT(*) FROM case_law_digest WHERE user_id = :uid"), {"uid": uid}
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text("SELECT * FROM case_law_digest WHERE user_id = :uid ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+        {"uid": uid, "lim": page_size, "off": offset},
+    )).mappings().all()
+    return {"total": count_row, "page": page, "page_size": page_size,
+            "pages": max(1, -(-int(count_row) // page_size)), "items": [dict(r) for r in rows]}
+
+
+@app.get("/api/case-law/digest/history/{digest_id}")
+async def get_digest_detail(
+    digest_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    row = (await session.execute(
+        text("SELECT * FROM case_law_digest WHERE id = :id LIMIT 1"), {"id": digest_id}
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Дайджест не знайдено")
+    return dict(row)
+
+
+@app.get("/api/case-law/sync/status")
+async def get_caselaw_sync_status(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    total = (await session.execute(
+        text("SELECT COUNT(*) FROM case_law_items WHERE user_id = :uid"), {"uid": uid}
+    )).scalar() or 0
+    latest = (await session.execute(
+        text("SELECT MAX(decision_date) FROM case_law_items WHERE user_id = :uid"), {"uid": uid}
+    )).scalar()
+    oldest = (await session.execute(
+        text("SELECT MIN(decision_date) FROM case_law_items WHERE user_id = :uid"), {"uid": uid}
+    )).scalar()
+    return {
+        "total_records": total, "sources": {"opendatabot": total},
+        "latest_decision_date": str(latest) if latest else None,
+        "oldest_decision_date": str(oldest) if oldest else None,
+        "last_sync_at": None, "last_sync_action": None, "last_sync_query": None,
+        "last_sync_limit": None, "last_sync_created": None, "last_sync_updated": None,
+        "last_sync_total": None, "last_sync_sources": [], "last_sync_seed_fallback_used": None,
+    }
+
+
+# ============================================================================
+# KNOWLEDGE BASE — виправляємо GET без слешу
+# ============================================================================
 
 @app.get("/api/knowledge-base")
-async def get_knowledge_base(current_user: dict = Depends(get_current_user)):
-    return {"items": []}
+async def get_knowledge_base(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    try:
+        rows = (await session.execute(
+            text("SELECT * FROM knowledge_entries WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"),
+            {"uid": uid},
+        )).mappings().all()
+        return {"items": [dict(r) for r in rows]}
+    except Exception:
+        return {"items": []}
 
+
+# ============================================================================
+# REGISTRY WATCH — повний CRUD з БД
+# ============================================================================
 
 @app.get("/api/registries/watch")
-async def get_registry_watch(current_user: dict = Depends(get_current_user)):
-    return {"items": []}
+async def get_registry_watch(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    try:
+        rows = (await session.execute(
+            text("SELECT * FROM registry_watch_items WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"),
+            {"uid": uid},
+        )).mappings().all()
+        total = len(rows)
+        return {"total": total, "page": 1, "page_size": 100, "pages": 1, "items": [dict(r) for r in rows]}
+    except Exception:
+        return {"total": 0, "page": 1, "page_size": 100, "pages": 1, "items": []}
 
+
+# ============================================================================
+# MONITORING STATUS
+# ============================================================================
 
 @app.get("/api/monitoring/status")
-async def get_monitoring_status(current_user: dict = Depends(get_current_user)):
-    return {"status": "inactive"}
+async def get_monitoring_status(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    try:
+        total = (await session.execute(
+            text("SELECT COUNT(*) FROM registry_watch_items WHERE user_id = :uid"), {"uid": uid}
+        )).scalar() or 0
+        active = (await session.execute(
+            text("SELECT COUNT(*) FROM registry_watch_items WHERE user_id = :uid AND status = 'active'"), {"uid": uid}
+        )).scalar() or 0
+        events_24h = (await session.execute(
+            text("SELECT COUNT(*) FROM registry_events WHERE user_id = :uid AND created_at > NOW() - INTERVAL '24 hours'"), {"uid": uid}
+        )).scalar() or 0
+    except Exception:
+        total, active, events_24h = 0, 0, 0
+    return {
+        "total_watch_items": total, "active_watch_items": active,
+        "due_watch_items": 0, "warning_watch_items": 0,
+        "state_changed_events_24h": events_24h,
+        "last_event_at": None, "by_status": {"active": active},
+        "status": "active" if active > 0 else "inactive",
+    }
 
+
+# ============================================================================
+# REPORTS — генерація з реальних даних
+# ============================================================================
 
 @app.get("/api/reports")
-async def get_reports(current_user: dict = Depends(get_current_user)):
-    return {"items": []}
+async def get_reports(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    reports = []
+    try:
+        docs = (await session.execute(
+            text("SELECT COUNT(*) FROM generated_documents WHERE user_id = :uid"), {"uid": uid}
+        )).scalar() or 0
+        cases = (await session.execute(
+            text("SELECT COUNT(*) FROM cases WHERE user_id = :uid"), {"uid": uid}
+        )).scalar() or 0
+        analyses = (await session.execute(
+            text("SELECT COUNT(*) FROM document_intakes WHERE user_id = :uid"), {"uid": uid}
+        )).scalar() or 0
+        now = datetime.utcnow().isoformat()
+        reports = [
+            {"id": "summary", "title": "Загальний звіт активності", "type": "summary",
+             "data": {"documents_generated": docs, "cases_total": cases, "analyses_done": analyses},
+             "created_at": now},
+        ]
+    except Exception:
+        pass
+    return {"items": reports}
 
+
+# ============================================================================
+# CALCULATIONS — реальна логіка + зберігання в БД
+# ============================================================================
 
 @app.get("/api/calculations/history")
-async def get_calculation_history(current_user: dict = Depends(get_current_user)):
-    return {"items": []}
+@app.get("/api/calculate/history")
+async def get_calculation_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20),
+    calculation_type: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    params: dict = {"uid": uid}
+    conditions = ["user_id = :uid"]
+    if calculation_type:
+        conditions.append("calculation_type = :ctype")
+        params["ctype"] = calculation_type
+    where = " AND ".join(conditions)
+    count_row = (await session.execute(
+        text(f"SELECT COUNT(*) FROM calculations WHERE {where}"), params
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text(f"SELECT * FROM calculations WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+        {**params, "lim": page_size, "off": offset},
+    )).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        for f in ("input_payload", "output_payload"):
+            if isinstance(d.get(f), str):
+                try:
+                    d[f] = json.loads(d[f])
+                except Exception:
+                    d[f] = {}
+        items.append(d)
+    return {"total": count_row, "page": page, "page_size": page_size,
+            "pages": max(1, -(-int(count_row) // page_size)), "items": items}
+
+
+@app.get("/api/calculate/{calc_id}")
+async def get_calculation_detail(
+    calc_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    row = (await session.execute(
+        text("SELECT * FROM calculations WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": calc_id, "uid": uid},
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Розрахунок не знайдено")
+    d = dict(row)
+    for f in ("input_payload", "output_payload"):
+        if isinstance(d.get(f), str):
+            try:
+                d[f] = json.loads(d[f])
+            except Exception:
+                d[f] = {}
+    return {"item": d}
 
 
 @app.post("/api/calculations/full-claim")
-async def calculate_full_claim(body: dict, current_user: dict = Depends(get_current_user)):
-    return {"status": "ok", "result": {}}
+@app.post("/api/calculate/full")
+async def calculate_full_claim(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    principal = float(body.get("principal_amount", body.get("principal", 0)))
+    rate = float(body.get("annual_rate", body.get("rate", 0.3)))
+    days = int(body.get("days_overdue", body.get("days", 0)))
+    court_fee_rate = float(body.get("court_fee_rate", 0.01))
+
+    penalty = round(principal * rate / 365 * days, 2)
+    court_fee = round(max(principal * court_fee_rate, 640), 2)
+    total_claim = round(principal + penalty, 2)
+    total_with_fee = round(total_claim + court_fee, 2)
+
+    from datetime import date, timedelta  # noqa: PLC0415
+    today = date.today()
+    process_deadline = (today + timedelta(days=30)).isoformat()
+    limitation_deadline = (today + timedelta(days=365 * 3)).isoformat()
+
+    result = {
+        "court_fee_uah": court_fee,
+        "penalty_uah": penalty,
+        "process_deadline": process_deadline,
+        "limitation_deadline": limitation_deadline,
+        "total_claim_uah": total_claim,
+        "total_with_fee_uah": total_with_fee,
+    }
+
+    cid = str(uuid.uuid4())
+    try:
+        await session.execute(
+            text("""
+                INSERT INTO calculations (id, user_id, calculation_type, title, input_payload, output_payload)
+                VALUES (:id, :uid, 'full_claim', :title, :inp::jsonb, :out::jsonb)
+            """),
+            {
+                "id": cid, "uid": uid,
+                "title": f"Претензія {principal:,.0f} грн × {days} днів",
+                "inp": json.dumps(body, ensure_ascii=False),
+                "out": json.dumps(result, ensure_ascii=False),
+            },
+        )
+        await session.commit()
+        saved = True
+    except Exception as e:
+        print(f"[calculations] DB error: {e}")
+        saved = False
+        cid = None
+
+    return {"status": "ok", "result": result, "saved": saved,
+            "calculation_id": cid, "created_at": datetime.utcnow().isoformat()}
+
+
+# ============================================================================
+# AUDIT LOG — реальна таблиця
+# ============================================================================
+
+async def _audit_log(session: AsyncSession, user_id: str, action: str, entity_type: str | None = None,
+                     entity_id: str | None = None, metadata: dict | None = None):
+    """Записати подію в audit_logs (best-effort)."""
+    try:
+        prev_hash = (await session.execute(
+            text("SELECT integrity_hash FROM audit_logs WHERE user_id = :uid ORDER BY created_at DESC LIMIT 1"),
+            {"uid": user_id},
+        )).scalar()
+        payload = f"{user_id}:{action}:{entity_type}:{entity_id}:{datetime.utcnow().isoformat()}"
+        curr_hash = hmac.new(_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        await session.execute(
+            text("""
+                INSERT INTO audit_logs (id, user_id, action, entity_type, entity_id, metadata,
+                    integrity_scope, integrity_prev_hash, integrity_hash)
+                VALUES (:id, :uid, :action, :etype, :eid, :meta::jsonb, 'user', :prev, :curr)
+            """),
+            {
+                "id": str(uuid.uuid4()), "uid": user_id, "action": action,
+                "etype": entity_type, "eid": entity_id,
+                "meta": json.dumps(metadata or {}, ensure_ascii=False),
+                "prev": prev_hash, "curr": curr_hash,
+            },
+        )
+    except Exception as e:
+        print(f"[audit_log] error: {e}")
 
 
 @app.get("/api/audit/history")
-async def get_audit_history(current_user: dict = Depends(get_current_user)):
-    return {"items": [], "total": 0}
+async def get_audit_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    action: str | None = Query(None),
+    entity_type: str | None = Query(None),
+    query: str | None = Query(None),
+    sort_dir: str = Query("desc"),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    conditions = ["user_id = :uid"]
+    params: dict = {"uid": uid}
+    if action:
+        conditions.append("action = :action")
+        params["action"] = action
+    if entity_type:
+        conditions.append("entity_type = :etype")
+        params["etype"] = entity_type
+    if query:
+        conditions.append("(action ILIKE :q OR entity_type ILIKE :q)")
+        params["q"] = f"%{query}%"
+    where = " AND ".join(conditions)
+    safe_dir = "DESC" if sort_dir == "desc" else "ASC"
+    count_row = (await session.execute(
+        text(f"SELECT COUNT(*) FROM audit_logs WHERE {where}"), params
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text(f"SELECT * FROM audit_logs WHERE {where} ORDER BY created_at {safe_dir} LIMIT :lim OFFSET :off"),
+        {**params, "lim": page_size, "off": offset},
+    )).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("metadata"), str):
+            try:
+                d["metadata"] = json.loads(d["metadata"])
+            except Exception:
+                d["metadata"] = {}
+        items.append(d)
+    return {
+        "user_id": uid, "total": count_row, "page": page, "page_size": page_size,
+        "pages": max(1, -(-int(count_row) // page_size)),
+        "action": action, "entity_type": entity_type, "query": query, "items": items,
+    }
+
+
+@app.get("/api/audit/integrity")
+async def get_audit_integrity(
+    max_rows: int = Query(100),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    rows = (await session.execute(
+        text("SELECT * FROM audit_logs WHERE user_id = :uid ORDER BY created_at ASC LIMIT :lim"),
+        {"uid": uid, "lim": max_rows},
+    )).mappings().all()
+    issues = []
+    for i, r in enumerate(rows):
+        if i > 0 and r.get("integrity_prev_hash") != rows[i - 1].get("integrity_hash"):
+            issues.append({
+                "row_id": str(r["id"]), "created_at": str(r.get("created_at")),
+                "code": "CHAIN_BROKEN", "message": "Порушено ланцюг хешів",
+            })
+    return {"scope": "user", "total_checked": len(rows), "issues": issues, "ok": len(issues) == 0}
+
+
+# ============================================================================
+# FORUM  (/forum/posts — без /api/ префіксу, як у frontend)
+# ============================================================================
+
+@app.get("/forum/posts")
+async def get_forum_posts(
+    case_id: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    params: dict = {}
+    conditions = []
+    if case_id:
+        conditions.append("f.case_id = :case_id")
+        params["case_id"] = case_id
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    rows = (await session.execute(
+        text(f"""
+            SELECT f.*, u.full_name as user_name,
+                (SELECT COUNT(*) FROM forum_comments c WHERE c.post_id = f.id) as comment_count
+            FROM forum_posts f
+            LEFT JOIN users u ON u.id = f.user_id
+            {where}
+            ORDER BY f.created_at DESC LIMIT 50
+        """), params,
+    )).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/forum/posts", status_code=201)
+async def create_forum_post(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    pid = str(uuid.uuid4())
+    await session.execute(
+        text("""
+            INSERT INTO forum_posts (id, user_id, title, content, category, case_id)
+            VALUES (:id, :uid, :title, :content, :category, :case_id)
+        """),
+        {"id": pid, "uid": uid, "title": body.get("title", ""),
+         "content": body.get("content", ""), "category": body.get("category"),
+         "case_id": body.get("case_id")},
+    )
+    await session.commit()
+    return {"id": pid, "user_id": uid, "user_name": current_user.get("full_name"),
+            "title": body.get("title", ""), "content": body.get("content", ""),
+            "category": body.get("category"), "case_id": body.get("case_id"),
+            "created_at": datetime.utcnow().isoformat(), "comment_count": 0}
+
+
+@app.get("/forum/posts/{post_id}")
+async def get_forum_post(
+    post_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    row = (await session.execute(
+        text("""
+            SELECT f.*, u.full_name as user_name
+            FROM forum_posts f LEFT JOIN users u ON u.id = f.user_id
+            WHERE f.id = :id LIMIT 1
+        """), {"id": post_id},
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Пост не знайдено")
+    comments = (await session.execute(
+        text("SELECT * FROM forum_comments WHERE post_id = :id ORDER BY created_at ASC"),
+        {"id": post_id},
+    )).mappings().all()
+    return {**dict(row), "comments": [dict(c) for c in comments]}
+
+
+@app.post("/forum/posts/{post_id}/comments", status_code=201)
+async def create_forum_comment(
+    post_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    cid = str(uuid.uuid4())
+    await session.execute(
+        text("INSERT INTO forum_comments (id, post_id, user_id, content) VALUES (:id, :pid, :uid, :content)"),
+        {"id": cid, "pid": post_id, "uid": uid, "content": body.get("content", "")},
+    )
+    await session.commit()
+    return {"id": cid, "post_id": post_id, "user_id": uid,
+            "content": body.get("content", ""), "created_at": datetime.utcnow().isoformat()}
 
 
 # ============================================================================
