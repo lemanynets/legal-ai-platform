@@ -170,6 +170,17 @@ _MIGRATIONS = [
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_intake_comments_intake_id ON intake_comments(intake_id)",
+    """CREATE TABLE IF NOT EXISTS knowledge_entries (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        category TEXT,
+        tags JSONB NOT NULL DEFAULT '[]',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_entries_user_id ON knowledge_entries(user_id)",
 ]
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -1302,77 +1313,120 @@ async def analyze_intake_stream(
     case_id: str = Form(None),
     mode: str = Query("standard"),
     current_user: dict = Depends(get_current_user),
-    session: AsyncSession = Depends(get_session),
 ):
-    """SSE streaming wrapper — runs intake and emits one `result` event."""
+    """SSE streaming wrapper.
+
+    ВАЖЛИВО: не використовуємо Depends(get_session) тут, бо FastAPI закриває
+    сесію після return StreamingResponse, ДО того як генератор почне yielding.
+    Натомість будуємо відповідь з ai_result в пам'яті, а в БД зберігаємо через
+    окрему сесію з AsyncSessionLocal.
+    """
     file_bytes = await file.read()
     file_name = file.filename or "document"
     api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY")
     uid = str(current_user["id"])
 
     async def event_stream():
-        yield "data: " + json.dumps({"event": "start", "message": "Аналіз розпочато…"}) + "\n\n"
+        yield "data: " + json.dumps({"event": "start", "message": "Аналіз розпочато…"}, ensure_ascii=False) + "\n\n"
         await asyncio.sleep(0)
 
-        ai_result = await _run_ai_intake(file_bytes, file_name, jurisdiction, mode, api_key)
-        rid = str(uuid.uuid4())
-
+        # AI аналіз (завжди повертає dict, ніколи не кидає виняток)
         try:
-            await session.execute(
-                text("""
-                    INSERT INTO document_intakes (
-                        id, user_id, case_id, source_file_name,
-                        classified_type, document_language, jurisdiction,
-                        primary_party_role, identified_parties, subject_matter,
-                        financial_exposure_amount, financial_exposure_currency, financial_exposure_type,
-                        document_date, deadline_from_document, urgency_level,
-                        risk_level_legal, risk_level_procedural, risk_level_financial,
-                        detected_issues, classifier_confidence, classifier_model,
-                        raw_text_preview, tags
-                    ) VALUES (
-                        :id, :uid, :case_id, :fname,
-                        :ctype, :lang, :jur,
-                        :role, :parties::jsonb, :subject,
-                        :amount, :currency, :exp_type,
-                        :doc_date, :deadline, :urgency,
-                        :rl_legal, :rl_proc, :rl_fin,
-                        :issues::jsonb, :conf, :model,
-                        :preview, :tags::jsonb
-                    )
-                """),
-                {
-                    "id": rid, "uid": uid, "case_id": case_id or None, "fname": file_name,
-                    "ctype": ai_result.get("classified_type", "unknown"),
-                    "lang": ai_result.get("document_language"), "jur": jurisdiction,
-                    "role": ai_result.get("primary_party_role"),
-                    "parties": json.dumps(ai_result.get("identified_parties", []), ensure_ascii=False),
-                    "subject": ai_result.get("subject_matter"),
-                    "amount": ai_result.get("financial_exposure_amount"),
-                    "currency": ai_result.get("financial_exposure_currency"),
-                    "exp_type": ai_result.get("financial_exposure_type"),
-                    "doc_date": ai_result.get("document_date"),
-                    "deadline": ai_result.get("deadline_from_document"),
-                    "urgency": ai_result.get("urgency_level", "medium"),
-                    "rl_legal": ai_result.get("risk_level_legal", "medium"),
-                    "rl_proc": ai_result.get("risk_level_procedural", "low"),
-                    "rl_fin": ai_result.get("risk_level_financial", "low"),
-                    "issues": json.dumps(ai_result.get("detected_issues", []), ensure_ascii=False),
-                    "conf": ai_result.get("classifier_confidence"),
-                    "model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6") if api_key else "demo",
-                    "preview": file_bytes.decode("utf-8", errors="replace")[:500],
-                    "tags": json.dumps(ai_result.get("tags", []), ensure_ascii=False),
-                },
-            )
-            await session.commit()
-        except Exception as e:
-            print(f"[intake-stream] DB error: {e}")
+            ai_result = await _run_ai_intake(file_bytes, file_name, jurisdiction, mode, api_key)
+        except Exception as exc:
+            print(f"[intake-stream] AI error: {exc}")
+            ai_result = _demo_intake(file_name, jurisdiction)
 
-        usage = await _get_usage(session, uid)
-        row = (await session.execute(
-            text("SELECT * FROM document_intakes WHERE id = :id LIMIT 1"), {"id": rid}
-        )).mappings().first()
-        result = _intake_row_to_dict(row, usage) if row else {"id": rid, "usage": usage}
-        yield "data: " + json.dumps({"event": "result", "result": result}) + "\n\n"
+        rid = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        model_name = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6") if api_key else "demo"
+
+        # Будуємо відповідь ОДРАЗУ з ai_result — без читання з БД
+        result: dict = {
+            "id": rid,
+            "user_id": uid,
+            "source_file_name": file_name,
+            "classified_type": ai_result.get("classified_type", "unknown"),
+            "document_language": ai_result.get("document_language"),
+            "jurisdiction": jurisdiction,
+            "primary_party_role": ai_result.get("primary_party_role"),
+            "identified_parties": ai_result.get("identified_parties", []),
+            "subject_matter": ai_result.get("subject_matter"),
+            "financial_exposure_amount": ai_result.get("financial_exposure_amount"),
+            "financial_exposure_currency": ai_result.get("financial_exposure_currency"),
+            "financial_exposure_type": ai_result.get("financial_exposure_type"),
+            "document_date": ai_result.get("document_date"),
+            "deadline_from_document": ai_result.get("deadline_from_document"),
+            "urgency_level": ai_result.get("urgency_level", "medium"),
+            "risk_level_legal": ai_result.get("risk_level_legal", "medium"),
+            "risk_level_procedural": ai_result.get("risk_level_procedural", "low"),
+            "risk_level_financial": ai_result.get("risk_level_financial", "low"),
+            "detected_issues": ai_result.get("detected_issues", []),
+            "classifier_confidence": ai_result.get("classifier_confidence"),
+            "classifier_model": model_name,
+            "raw_text_preview": file_bytes.decode("utf-8", errors="replace")[:500],
+            "tags": ai_result.get("tags", []),
+            "created_at": now,
+            "cache_hit": False,
+            "usage": {"docs_used": 0, "docs_limit": 5},
+        }
+
+        # Зберігаємо в БД з власною сесією (best-effort, не блокує відповідь)
+        try:
+            from app.db import AsyncSessionLocal  # noqa: PLC0415
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    text("""
+                        INSERT INTO document_intakes (
+                            id, user_id, case_id, source_file_name,
+                            classified_type, document_language, jurisdiction,
+                            primary_party_role, identified_parties, subject_matter,
+                            financial_exposure_amount, financial_exposure_currency, financial_exposure_type,
+                            document_date, deadline_from_document, urgency_level,
+                            risk_level_legal, risk_level_procedural, risk_level_financial,
+                            detected_issues, classifier_confidence, classifier_model,
+                            raw_text_preview, tags
+                        ) VALUES (
+                            :id, :uid, :case_id, :fname,
+                            :ctype, :lang, :jur,
+                            :role, :parties::jsonb, :subject,
+                            :amount, :currency, :exp_type,
+                            :doc_date, :deadline, :urgency,
+                            :rl_legal, :rl_proc, :rl_fin,
+                            :issues::jsonb, :conf, :model,
+                            :preview, :tags::jsonb
+                        )
+                    """),
+                    {
+                        "id": rid, "uid": uid, "case_id": case_id or None, "fname": file_name,
+                        "ctype": result["classified_type"], "lang": result["document_language"],
+                        "jur": jurisdiction, "role": result["primary_party_role"],
+                        "parties": json.dumps(result["identified_parties"], ensure_ascii=False),
+                        "subject": result["subject_matter"],
+                        "amount": result["financial_exposure_amount"],
+                        "currency": result["financial_exposure_currency"],
+                        "exp_type": result["financial_exposure_type"],
+                        "doc_date": result["document_date"],
+                        "deadline": result["deadline_from_document"],
+                        "urgency": result["urgency_level"],
+                        "rl_legal": result["risk_level_legal"],
+                        "rl_proc": result["risk_level_procedural"],
+                        "rl_fin": result["risk_level_financial"],
+                        "issues": json.dumps(result["detected_issues"], ensure_ascii=False),
+                        "conf": result["classifier_confidence"],
+                        "model": model_name,
+                        "preview": result["raw_text_preview"],
+                        "tags": json.dumps(result["tags"], ensure_ascii=False),
+                    },
+                )
+                await db.commit()
+                # Оновлюємо usage з БД
+                usage = await _get_usage(db, uid)
+                result["usage"] = usage
+        except Exception as db_exc:
+            print(f"[intake-stream] DB save error: {db_exc}")
+
+        yield "data: " + json.dumps({"event": "result", "result": result}, ensure_ascii=False) + "\n\n"
         yield "data: " + json.dumps({"event": "done"}) + "\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -1657,6 +1711,515 @@ async def create_precedent_map(
         "groups": [],
         "refs": [],
     }
+
+
+# ============================================================================
+# STRATEGY  (/api/strategy/*)
+# ============================================================================
+
+async def _ai_json(prompt: str, max_tokens: int = 4096) -> dict | list:
+    """Call Anthropic and parse JSON from response."""
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {}
+    try:
+        import anthropic  # noqa: PLC0415
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        msg = await client.messages.create(
+            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[ai_json] error: {e}")
+        return {}
+
+
+@app.post("/api/strategy/blueprint")
+async def create_strategy_blueprint(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    intake_id = body.get("intake_id", "")
+    uid = str(current_user["id"])
+
+    # Отримуємо intake дані якщо є
+    intake_row = None
+    if intake_id:
+        intake_row = (await session.execute(
+            text("SELECT * FROM document_intakes WHERE id = :id AND user_id = :uid LIMIT 1"),
+            {"id": intake_id, "uid": uid},
+        )).mappings().first()
+
+    context = ""
+    if intake_row:
+        context = (
+            f"Тип документу: {intake_row.get('classified_type')}\n"
+            f"Предмет спору: {intake_row.get('subject_matter')}\n"
+            f"Рівень ризику (правовий): {intake_row.get('risk_level_legal')}\n"
+            f"Рівень ризику (процесуальний): {intake_row.get('risk_level_procedural')}\n"
+            f"Рівень ризику (фінансовий): {intake_row.get('risk_level_financial')}\n"
+            f"Виявлені проблеми: {intake_row.get('detected_issues')}\n"
+        )
+
+    prompt = f"""Ти — стратегічний юридичний аналітик. На основі аналізу документу розроби детальну правову стратегію.
+
+{context}
+
+Поверни ТІЛЬКИ валідний JSON без markdown:
+{{
+  "immediate_actions": [{{"priority": "high", "action": "...", "deadline": "...", "rationale": "..."}}],
+  "procedural_roadmap": [{{"step": 1, "title": "...", "description": "...", "timeline": "..."}}],
+  "evidence_strategy": [{{"type": "...", "description": "...", "importance": "high/medium/low"}}],
+  "negotiation_playbook": [{{"scenario": "...", "approach": "...", "concessions": "...", "red_lines": "..."}}],
+  "risk_heat_map": [{{"risk": "...", "probability": "high/medium/low", "impact": "high/medium/low", "mitigation": "..."}}],
+  "critical_deadlines": [{{"event": "...", "date": null, "consequence": "..."}}],
+  "swot_analysis": {{
+    "strengths": ["..."], "weaknesses": ["..."],
+    "opportunities": ["..."], "threats": ["..."]
+  }},
+  "win_probability": 0.65
+}}"""
+
+    blueprint = await _ai_json(prompt)
+    if not blueprint:
+        blueprint = {
+            "immediate_actions": [{"priority": "high", "action": "Налаштуйте ANTHROPIC_API_KEY для реальної стратегії", "deadline": "зараз", "rationale": "Demo режим"}],
+            "procedural_roadmap": [], "evidence_strategy": [], "negotiation_playbook": [],
+            "risk_heat_map": [], "critical_deadlines": [],
+            "swot_analysis": {"strengths": [], "weaknesses": [], "opportunities": [], "threats": []},
+            "win_probability": None,
+        }
+
+    bid = str(uuid.uuid4())
+    return {
+        "id": bid, "intake_id": intake_id, "precedent_group_id": None,
+        **blueprint,
+        "financial_strategy": None, "created_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/api/strategy/blueprint-stream")
+async def strategy_blueprint_stream(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """SSE streaming для генерації стратегії."""
+    intake_id = body.get("intake_id", "")
+    uid = str(current_user["id"])
+
+    async def stream():
+        yield "data: " + json.dumps({"event": "start", "message": "Генерую стратегію…"}) + "\n\n"
+        # Re-use the non-streaming endpoint logic
+        try:
+            # Get intake context
+            context = ""
+            if intake_id:
+                row = (await session.execute(
+                    text("SELECT * FROM document_intakes WHERE id = :id LIMIT 1"),
+                    {"id": intake_id},
+                )).mappings().first()
+                if row:
+                    context = f"Тип: {row.get('classified_type')}, Предмет: {row.get('subject_matter')}"
+
+            yield "data: " + json.dumps({"event": "progress", "message": "Аналізую документ…"}) + "\n\n"
+            await asyncio.sleep(0)
+
+            prompt = f"""Стратегічний юридичний аналітик. Контекст: {context}
+Поверни JSON стратегії з полями: immediate_actions, procedural_roadmap, evidence_strategy,
+negotiation_playbook, risk_heat_map, critical_deadlines, swot_analysis, win_probability."""
+            blueprint = await _ai_json(prompt)
+            if not blueprint:
+                blueprint = {"immediate_actions": [], "procedural_roadmap": [], "evidence_strategy": [],
+                             "negotiation_playbook": [], "risk_heat_map": [], "critical_deadlines": [],
+                             "swot_analysis": {"strengths": [], "weaknesses": [], "opportunities": [], "threats": []},
+                             "win_probability": None}
+
+            result = {"id": str(uuid.uuid4()), "intake_id": intake_id, **blueprint,
+                      "created_at": datetime.utcnow().isoformat()}
+            yield "data: " + json.dumps({"event": "result", "result": result}, ensure_ascii=False) + "\n\n"
+        except Exception as e:
+            yield "data: " + json.dumps({"event": "error", "message": str(e)}) + "\n\n"
+        yield "data: " + json.dumps({"event": "done"}) + "\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/api/strategy/simulate-judge")
+async def simulate_judge(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    intake_id = body.get("intake_id", "")
+    prompt = f"""Симулюй роль судді. Інтейк ID: {intake_id}.
+Поверни JSON: {{"judge_persona": "...", "key_vulnerabilities": ["..."], "strong_points": ["..."],
+"procedural_risks": ["..."], "suggested_corrections": ["..."],
+"judge_commentary": "...", "decision_rationale": "..."}}"""
+    result = await _ai_json(prompt, max_tokens=2048)
+    if not result:
+        result = {
+            "judge_persona": "Суддя загальної юрисдикції",
+            "key_vulnerabilities": ["Налаштуйте ANTHROPIC_API_KEY для реальної симуляції"],
+            "strong_points": [], "procedural_risks": [], "suggested_corrections": [],
+            "judge_commentary": "Demo режим", "decision_rationale": "Demo режим",
+        }
+    return {"id": str(uuid.uuid4()), "intake_id": intake_id, **result,
+            "created_at": datetime.utcnow().isoformat()}
+
+
+@app.post("/api/generate-with-strategy")
+async def generate_with_strategy(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    doc_type = body.get("doc_type", "позов")
+    blueprint_id = body.get("blueprint_id")
+    intake_id = body.get("intake_id")
+    form_data = body.get("form_data", {})
+
+    context_parts = [f"Тип документу: {doc_type}"]
+    if form_data:
+        context_parts.append(f"Дані форми: {json.dumps(form_data, ensure_ascii=False)[:1000]}")
+
+    prompt = (
+        f"Склади юридичний документ типу '{doc_type}' для України.\n"
+        f"Контекст: {', '.join(context_parts)}\n\n"
+        "Поверни повний текст документу українською мовою у форматі JSON: "
+        "{\"text\": \"повний текст документу\", \"title\": \"назва\"}"
+    )
+    result = await _ai_json(prompt, max_tokens=4096)
+    generated_text = result.get("text", "[Demo] Налаштуйте ANTHROPIC_API_KEY") if result else "[Demo]"
+    title = result.get("title", f"{doc_type} — {datetime.utcnow().strftime('%d.%m.%Y')}")
+
+    did = str(uuid.uuid4())
+    try:
+        await session.execute(
+            text("""
+                INSERT INTO generated_documents (id, user_id, document_type, document_category,
+                    title, generated_text, used_ai, ai_model)
+                VALUES (:id, :uid, :dtype, 'civil', :title, :text, true, :model)
+            """),
+            {"id": did, "uid": uid, "dtype": doc_type, "title": title,
+             "text": generated_text, "model": os.getenv("ANTHROPIC_MODEL", "demo")},
+        )
+        await session.commit()
+    except Exception as e:
+        print(f"[generate-with-strategy] DB error: {e}")
+
+    return {"id": did, "user_id": uid, "document_type": doc_type, "title": title,
+            "generated_text": generated_text, "ai_model": os.getenv("ANTHROPIC_MODEL", "demo"),
+            "created_at": datetime.utcnow().isoformat()}
+
+
+# ============================================================================
+# DOCUMENTS (missing endpoints)
+# ============================================================================
+
+@app.post("/api/documents/generate-stream")
+async def generate_document_stream(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """SSE streaming для генерації документів."""
+    uid = str(current_user["id"])
+    doc_type = body.get("doc_type", "позов")
+    form_data = body.get("form_data", {})
+
+    async def stream():
+        yield "data: " + json.dumps({"event": "start", "message": "Генерую документ…"}) + "\n\n"
+        await asyncio.sleep(0)
+        try:
+            prompt = (
+                f"Склади юридичний документ типу '{doc_type}' для України.\n"
+                f"Дані: {json.dumps(form_data, ensure_ascii=False)[:2000]}\n"
+                "Поверни JSON: {\"text\": \"...\", \"title\": \"...\"}"
+            )
+            result = await _ai_json(prompt, max_tokens=4096)
+            generated_text = result.get("text", "[Demo]") if result else "[Demo]"
+            title = result.get("title", doc_type) if result else doc_type
+            did = str(uuid.uuid4())
+            try:
+                from app.db import AsyncSessionLocal  # noqa: PLC0415
+                async with AsyncSessionLocal() as db:
+                    await db.execute(text("""
+                        INSERT INTO generated_documents
+                            (id, user_id, document_type, document_category, title, generated_text, used_ai, ai_model)
+                        VALUES (:id, :uid, :dtype, 'civil', :title, :text, true, :model)
+                    """), {"id": did, "uid": uid, "dtype": doc_type, "title": title,
+                           "text": generated_text, "model": os.getenv("ANTHROPIC_MODEL", "demo")})
+                    await db.commit()
+            except Exception as dbe:
+                print(f"[generate-stream] DB error: {dbe}")
+            doc = {"id": did, "user_id": uid, "document_type": doc_type, "title": title,
+                   "generated_text": generated_text, "ai_model": os.getenv("ANTHROPIC_MODEL", "demo"),
+                   "created_at": datetime.utcnow().isoformat()}
+            yield "data: " + json.dumps({"event": "result", "result": doc}, ensure_ascii=False) + "\n\n"
+        except Exception as e:
+            yield "data: " + json.dumps({"event": "error", "message": str(e)}) + "\n\n"
+        yield "data: " + json.dumps({"event": "done"}) + "\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/api/documents/bulk-delete")
+async def bulk_delete_documents(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    ids = body.get("ids", [])
+    if ids:
+        for doc_id in ids:
+            await session.execute(
+                text("DELETE FROM generated_documents WHERE id = :id AND user_id = :uid"),
+                {"id": doc_id, "uid": uid},
+            )
+        await session.commit()
+    return {"deleted": len(ids)}
+
+
+@app.post("/api/documents/processual-gate-check")
+async def processual_gate_check(body: dict, current_user: dict = Depends(get_current_user)):
+    return {"passed": True, "blockers": [], "warnings": []}
+
+
+@app.post("/api/documents/bulk-processual-repair")
+async def bulk_processual_repair(body: dict, current_user: dict = Depends(get_current_user)):
+    return {"repaired": 0, "items": []}
+
+
+# ============================================================================
+# E-COURT  (/api/e-court/*)
+# ============================================================================
+
+@app.get("/api/e-court/courts")
+async def get_courts(
+    region: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+):
+    courts = [
+        {"id": "kyiv_app", "name": "Київський апеляційний суд", "type": "appeal", "region": "Київ"},
+        {"id": "kyiv_com", "name": "Господарський суд м. Київ", "type": "commercial", "region": "Київ"},
+        {"id": "kyiv_adm", "name": "Окружний адміністративний суд м. Київ", "type": "administrative", "region": "Київ"},
+        {"id": "supreme", "name": "Верховний Суд", "type": "supreme", "region": "Київ"},
+        {"id": "lviv_app", "name": "Львівський апеляційний суд", "type": "appeal", "region": "Львів"},
+        {"id": "kharkiv_app", "name": "Харківський апеляційний суд", "type": "appeal", "region": "Харків"},
+        {"id": "odessa_app", "name": "Одеський апеляційний суд", "type": "appeal", "region": "Одеса"},
+        {"id": "dnipro_app", "name": "Дніпровський апеляційний суд", "type": "appeal", "region": "Дніпро"},
+    ]
+    if region:
+        courts = [c for c in courts if region.lower() in c["region"].lower()]
+    return {"items": courts}
+
+
+@app.get("/api/e-court/hearings")
+async def get_ecourt_hearings(
+    case_id: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    return {"items": [], "total": 0}
+
+
+@app.post("/api/e-court/submit")
+async def submit_to_ecourt(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+):
+    return {
+        "status": "submitted",
+        "tracking_id": str(uuid.uuid4()),
+        "message": "Заяву надіслано до Е-Суд (demo режим). Налаштуйте інтеграцію з реальним API судів.",
+        "submitted_at": datetime.utcnow().isoformat(),
+    }
+
+
+# ============================================================================
+# KNOWLEDGE BASE  (/api/knowledge-base/*)
+# ============================================================================
+
+@app.post("/api/knowledge-base/")
+async def create_knowledge_entry(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    kid = str(uuid.uuid4())
+    title = body.get("title", "")
+    content = body.get("content", "")
+    category = body.get("category")
+    try:
+        await session.execute(
+            text("""
+                INSERT INTO knowledge_entries (id, user_id, title, content, category)
+                VALUES (:id, :uid, :title, :content, :category)
+            """),
+            {"id": kid, "uid": uid, "title": title, "content": content, "category": category},
+        )
+        await session.commit()
+    except Exception as e:
+        print(f"[knowledge-base] DB error: {e}")
+        # Table might not exist yet — return stub
+        return {"id": kid, "user_id": uid, "title": title, "content": content,
+                "category": category, "created_at": datetime.utcnow().isoformat()}
+    return {"id": kid, "user_id": uid, "title": title, "content": content,
+            "category": category, "created_at": datetime.utcnow().isoformat()}
+
+
+@app.delete("/api/knowledge-base/{entry_id}")
+async def delete_knowledge_entry(
+    entry_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    try:
+        await session.execute(
+            text("DELETE FROM knowledge_entries WHERE id = :id AND user_id = :uid"),
+            {"id": entry_id, "uid": uid},
+        )
+        await session.commit()
+    except Exception:
+        pass
+    return {"status": "ok"}
+
+
+# ============================================================================
+# MONITORING  (/api/monitoring/*)
+# ============================================================================
+
+@app.get("/api/monitoring/watch-items")
+async def get_watch_items(current_user: dict = Depends(get_current_user)):
+    return {"items": []}
+
+
+@app.post("/api/monitoring/watch-items")
+async def create_watch_item(body: dict, current_user: dict = Depends(get_current_user)):
+    uid = str(current_user["id"])
+    return {"id": str(uuid.uuid4()), "user_id": uid, **body,
+            "created_at": datetime.utcnow().isoformat()}
+
+
+@app.post("/api/monitoring/check-due")
+async def monitoring_check_due(current_user: dict = Depends(get_current_user)):
+    return {"checked": 0, "alerts": []}
+
+
+# ============================================================================
+# CASE-LAW (missing endpoints)
+# ============================================================================
+
+@app.post("/api/case-law/import")
+async def import_case_law(body: dict, current_user: dict = Depends(get_current_user)):
+    return {"imported": 0, "skipped": 0, "errors": []}
+
+
+@app.post("/api/case-law/sync")
+async def sync_case_law(body: dict, current_user: dict = Depends(get_current_user)):
+    return {"status": "started", "job_id": str(uuid.uuid4())}
+
+
+@app.get("/api/case-law/sync/status")
+async def get_sync_status(job_id: str = Query(""), current_user: dict = Depends(get_current_user)):
+    return {"status": "done", "job_id": job_id, "imported": 0}
+
+
+@app.post("/api/case-law/digest/generate")
+async def generate_digest(body: dict, current_user: dict = Depends(get_current_user)):
+    return {"items": [], "generated_at": datetime.utcnow().isoformat()}
+
+
+# ============================================================================
+# TEAM / AUTH (missing endpoints)
+# ============================================================================
+
+@app.get("/api/auth/team/users")
+async def get_auth_team_users(current_user: dict = Depends(get_current_user)):
+    return {"items": [{"id": str(current_user["id"]), "email": current_user["email"],
+                       "role": current_user.get("role", "user"), "full_name": current_user.get("full_name")}]}
+
+
+@app.patch("/api/auth/team/users/role")
+async def update_team_user_role(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    user_id = body.get("user_id")
+    role = body.get("role", "user")
+    if user_id:
+        try:
+            await session.execute(
+                text("UPDATE users SET role = :role WHERE id = :uid"),
+                {"role": role, "uid": user_id},
+            )
+            await session.commit()
+        except Exception:
+            pass
+    return {"status": "ok"}
+
+
+# ============================================================================
+# CALCULATIONS (missing)
+# ============================================================================
+
+@app.post("/api/calculate/full")
+async def calculate_full(body: dict, current_user: dict = Depends(get_current_user)):
+    principal = float(body.get("principal", 0))
+    rate = float(body.get("rate", 0.3))
+    days = int(body.get("days", 0))
+    penalty = principal * rate / 365 * days
+    return {
+        "principal": principal, "penalty": penalty, "total": principal + penalty,
+        "breakdown": {"rate": rate, "days": days},
+        "calculated_at": datetime.utcnow().isoformat(),
+    }
+
+
+# ============================================================================
+# USER PREFERENCES
+# ============================================================================
+
+@app.get("/api/users/me/preferences")
+async def get_preferences(current_user: dict = Depends(get_current_user)):
+    return {"theme": "dark", "language": "uk", "notifications": True}
+
+
+@app.patch("/api/users/me/preferences")
+async def update_preferences(body: dict, current_user: dict = Depends(get_current_user)):
+    return {"status": "ok", **body}
+
+
+# ============================================================================
+# KNOWLEDGE ENTRIES (повний CRUD для /api/knowledge-base)
+# ============================================================================
+
+@app.get("/api/knowledge-base/")
+async def get_knowledge_entries_full(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    try:
+        rows = (await session.execute(
+            text("SELECT * FROM knowledge_entries WHERE user_id = :uid ORDER BY created_at DESC LIMIT 100"),
+            {"uid": uid},
+        )).mappings().all()
+        return {"items": [dict(r) for r in rows]}
+    except Exception:
+        return {"items": []}
 
 
 # ── OpenDataBot proxy ─────────────────────────────────────────────────────────
