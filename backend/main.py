@@ -305,6 +305,33 @@ _MIGRATIONS = [
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_forum_comments_post_id ON forum_comments(post_id)",
+    # ── E-Court Submissions ───────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS ecourt_submissions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        document_id UUID REFERENCES generated_documents(id) ON DELETE SET NULL,
+        provider TEXT NOT NULL DEFAULT 'manual',
+        external_submission_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'submitted',
+        court_name TEXT NOT NULL DEFAULT '',
+        signer_method TEXT,
+        note TEXT,
+        tracking_url TEXT,
+        error_message TEXT,
+        submitted_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_ecourt_submissions_user_id ON ecourt_submissions(user_id)",
+    # ── Document Versions ────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS document_versions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        document_id UUID NOT NULL REFERENCES generated_documents(id) ON DELETE CASCADE,
+        version_number INT NOT NULL DEFAULT 1,
+        action TEXT NOT NULL DEFAULT 'edit',
+        generated_text TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_document_versions_doc_id ON document_versions(document_id)",
 ]
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -768,6 +795,21 @@ async def update_document(
 
     fields: dict = {}
     if "generated_text" in body:
+        # Save current version before overwriting
+        try:
+            cur = (await session.execute(
+                text("SELECT generated_text FROM generated_documents WHERE id = :id LIMIT 1"), {"id": doc_id}
+            )).scalar()
+            max_ver = (await session.execute(
+                text("SELECT COALESCE(MAX(version_number), 0) FROM document_versions WHERE document_id = :did"),
+                {"did": doc_id},
+            )).scalar() or 0
+            await session.execute(
+                text("INSERT INTO document_versions (id, document_id, version_number, action, generated_text) VALUES (:id, :did, :ver, 'edit', :text)"),
+                {"id": str(uuid.uuid4()), "did": doc_id, "ver": max_ver + 1, "text": cur or ""},
+            )
+        except Exception as ve:
+            print(f"[versioning] {ve}")
         fields["generated_text"] = body["generated_text"]
         fields["preview_text"] = body["generated_text"][:200] if body["generated_text"] else ""
     if "case_id" in body:
@@ -779,6 +821,7 @@ async def update_document(
     fields["id"] = doc_id
     await session.execute(text(f"UPDATE generated_documents SET {sets} WHERE id = :id"), fields)
     await session.commit()
+    await _audit_log(session, uid, "document_update", "document", doc_id)
     return {"status": "ok", "id": doc_id, "has_docx_export": False, "has_pdf_export": False}
 
 
@@ -788,11 +831,13 @@ async def delete_document(
     current_user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
+    uid = str(current_user["id"])
     await session.execute(
         text("DELETE FROM generated_documents WHERE id = :id AND user_id = :uid"),
-        {"id": doc_id, "uid": str(current_user["id"])},
+        {"id": doc_id, "uid": uid},
     )
     await session.commit()
+    await _audit_log(session, uid, "document_delete", "document", doc_id)
     return {"status": "deleted", "id": doc_id}
 
 
@@ -1141,10 +1186,19 @@ async def global_search(
         )
     ).mappings().all()
 
+    forum_rows = []
+    try:
+        forum_rows = (await session.execute(
+            text("SELECT id, title FROM forum_posts WHERE (user_id = :uid OR 1=1) AND title ILIKE :q LIMIT 5"),
+            {"uid": uid, "q": pattern},
+        )).mappings().all()
+    except Exception:
+        pass
+
     return {
         "cases": [{"id": str(c["id"]), "title": c["title"], "number": c.get("case_number")} for c in cases],
         "documents": [{"id": str(d["id"]), "type": d["document_type"], "preview": d.get("preview_text", "")} for d in docs],
-        "forum": [],
+        "forum": [{"id": str(f["id"]), "title": f["title"]} for f in forum_rows],
     }
 
 
@@ -2994,6 +3048,713 @@ async def get_opendatabot_usage(current_user: dict = Depends(get_current_user)):
 async def get_company(code: str, current_user: dict = Depends(get_current_user)):
     data = await _odb_get(f"/v1/company/{code}")
     return data
+
+
+# ============================================================================
+# E-COURT — повний CRUD з таблицею ecourt_submissions
+# ============================================================================
+
+@app.get("/api/e-court/history")
+async def get_ecourt_history(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20),
+    status: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    params: dict = {"uid": uid}
+    conditions = ["user_id = :uid"]
+    if status:
+        conditions.append("status = :status")
+        params["status"] = status
+    where = " AND ".join(conditions)
+    count_row = (await session.execute(
+        text(f"SELECT COUNT(*) FROM ecourt_submissions WHERE {where}"), params
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text(f"SELECT * FROM ecourt_submissions WHERE {where} ORDER BY submitted_at DESC LIMIT :lim OFFSET :off"),
+        {**params, "lim": page_size, "off": offset},
+    )).mappings().all()
+    return {"total": count_row, "page": page, "page_size": page_size,
+            "pages": max(1, -(-int(count_row) // page_size)), "items": [dict(r) for r in rows]}
+
+
+@app.post("/api/e-court/submit")
+async def submit_to_ecourt(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    sid = str(uuid.uuid4())
+    ext_id = f"ES-{sid[:8].upper()}"
+    await session.execute(
+        text("""
+            INSERT INTO ecourt_submissions
+                (id, user_id, document_id, provider, external_submission_id,
+                 status, court_name, signer_method, note)
+            VALUES (:id, :uid, :doc_id, 'manual', :ext_id,
+                    'submitted', :court, :signer, :note)
+        """),
+        {
+            "id": sid, "uid": uid,
+            "doc_id": body.get("document_id"),
+            "ext_id": ext_id,
+            "court": body.get("court_name", ""),
+            "signer": body.get("signer_method", "manual"),
+            "note": body.get("note"),
+        },
+    )
+    await session.commit()
+    submission = {
+        "id": sid, "document_id": body.get("document_id"), "provider": "manual",
+        "external_submission_id": ext_id, "status": "submitted",
+        "court_name": body.get("court_name", ""), "signer_method": body.get("signer_method"),
+        "tracking_url": None, "error_message": None,
+        "submitted_at": datetime.utcnow().isoformat(), "updated_at": datetime.utcnow().isoformat(),
+    }
+    await _audit_log(session, uid, "ecourt_submit", "ecourt_submission", sid)
+    return {"status": "submitted", "submission": submission}
+
+
+@app.get("/api/e-court/{submission_id}/status")
+async def get_ecourt_status(
+    submission_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    row = (await session.execute(
+        text("SELECT * FROM ecourt_submissions WHERE id = :id LIMIT 1"), {"id": submission_id}
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Подання не знайдено")
+    return {"submission": dict(row)}
+
+
+@app.post("/api/e-court/{submission_id}/sync-status")
+async def sync_ecourt_status(
+    submission_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    row = (await session.execute(
+        text("SELECT * FROM ecourt_submissions WHERE id = :id LIMIT 1"), {"id": submission_id}
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Подання не знайдено")
+    return {"submission": dict(row), "synced_live": False}
+
+
+@app.get("/api/e-court/public-search")
+async def ecourt_public_search(
+    case_number: str = Query(""),
+    current_user: dict = Depends(get_current_user),
+):
+    """Пошук справи через OpenDataBot якщо є ключ, інакше — порожній результат."""
+    if not case_number.strip():
+        raise HTTPException(status_code=400, detail="Номер справи обов'язковий")
+    if _ODB_KEY:
+        try:
+            data = await _odb_get("/v1/court/case", params={"number": case_number})
+            return {
+                "status": "found", "case_number": case_number,
+                "assignments": data.get("assignments", []),
+                "history": data.get("history", []),
+            }
+        except HTTPException as e:
+            if e.status_code == 404:
+                return {"status": "not_found", "case_number": case_number, "assignments": [], "history": []}
+            raise
+    return {"status": "no_key", "case_number": case_number, "assignments": [], "history": []}
+
+
+# ============================================================================
+# MONITORING — повний CRUD watch-items з OpenDataBot перевіркою
+# ============================================================================
+
+@app.get("/api/monitoring/watch-items")
+async def get_watch_items_list(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20),
+    registry_type: str | None = Query(None),
+    status: str | None = Query(None),
+    query: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    params: dict = {"uid": uid}
+    conditions = ["user_id = :uid"]
+    if registry_type:
+        conditions.append("registry_type = :rtype")
+        params["rtype"] = registry_type
+    if status:
+        conditions.append("status = :status")
+        params["status"] = status
+    if query:
+        conditions.append("(entity_name ILIKE :q OR identifier ILIKE :q)")
+        params["q"] = f"%{query}%"
+    where = " AND ".join(conditions)
+    count_row = (await session.execute(
+        text(f"SELECT COUNT(*) FROM registry_watch_items WHERE {where}"), params
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text(f"SELECT * FROM registry_watch_items WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+        {**params, "lim": page_size, "off": offset},
+    )).mappings().all()
+    return {"total": count_row, "page": page, "page_size": page_size,
+            "pages": max(1, -(-int(count_row) // page_size)), "items": [dict(r) for r in rows]}
+
+
+@app.post("/api/monitoring/watch-items", status_code=201)
+async def create_watch_item_full(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    wid = str(uuid.uuid4())
+    from datetime import timedelta  # noqa: PLC0415
+    next_check = datetime.utcnow() + timedelta(hours=int(body.get("check_interval_hours", 24)))
+    await session.execute(
+        text("""
+            INSERT INTO registry_watch_items
+                (id, user_id, source, registry_type, identifier, entity_name,
+                 status, check_interval_hours, next_check_at, notes)
+            VALUES (:id, :uid, :source, :rtype, :ident, :name,
+                    'active', :interval, :next_check, :notes)
+        """),
+        {
+            "id": wid, "uid": uid,
+            "source": body.get("source", "opendatabot"),
+            "rtype": body.get("registry_type", "company"),
+            "ident": body.get("identifier", ""),
+            "name": body.get("entity_name", ""),
+            "interval": body.get("check_interval_hours", 24),
+            "next_check": next_check,
+            "notes": body.get("notes"),
+        },
+    )
+    await session.commit()
+    row = (await session.execute(
+        text("SELECT * FROM registry_watch_items WHERE id = :id LIMIT 1"), {"id": wid}
+    )).mappings().first()
+    item = dict(row) if row else {"id": wid, "user_id": uid, **body}
+    return {"status": "created", "item": item}
+
+
+@app.delete("/api/monitoring/watch-items/{item_id}")
+async def delete_watch_item(
+    item_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    await session.execute(
+        text("DELETE FROM registry_watch_items WHERE id = :id AND user_id = :uid"),
+        {"id": item_id, "uid": uid},
+    )
+    await session.commit()
+    return {"status": "deleted", "id": item_id}
+
+
+@app.post("/api/monitoring/watch-items/{item_id}/check")
+async def check_watch_item(
+    item_id: str,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    row = (await session.execute(
+        text("SELECT * FROM registry_watch_items WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": item_id, "uid": uid},
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Запис спостереження не знайдено")
+
+    item = dict(row)
+    event_type = "state_unchanged"
+    severity = "info"
+    title = f"Перевірено: {item.get('entity_name', item.get('identifier'))}"
+    details: dict = {}
+
+    # Якщо є OPENDATABOT_API_KEY — реальна перевірка
+    if _ODB_KEY and item.get("registry_type") == "company":
+        try:
+            data = await _odb_get(f"/v1/company/{item['identifier']}")
+            new_status = data.get("status", "")
+            prev_snapshot = item.get("latest_snapshot") or {}
+            if isinstance(prev_snapshot, str):
+                try:
+                    prev_snapshot = json.loads(prev_snapshot)
+                except Exception:
+                    prev_snapshot = {}
+            if new_status != prev_snapshot.get("status"):
+                event_type = "state_changed"
+                severity = "warning"
+                title = f"Зміна статусу: {item.get('entity_name')}"
+            details = {"old_status": prev_snapshot.get("status"), "new_status": new_status}
+            await session.execute(
+                text("""UPDATE registry_watch_items SET last_checked_at = NOW(),
+                    latest_snapshot = :snap::jsonb, last_change_at = CASE WHEN :changed THEN NOW() ELSE last_change_at END
+                    WHERE id = :id"""),
+                {"snap": json.dumps(data, ensure_ascii=False), "changed": event_type == "state_changed", "id": item_id},
+            )
+        except Exception as e:
+            details = {"error": str(e)}
+    else:
+        await session.execute(
+            text("UPDATE registry_watch_items SET last_checked_at = NOW() WHERE id = :id"),
+            {"id": item_id},
+        )
+
+    eid = str(uuid.uuid4())
+    await session.execute(
+        text("""
+            INSERT INTO registry_events (id, user_id, watch_item_id, event_type, severity, title, details)
+            VALUES (:id, :uid, :wid, :etype, :sev, :title, :details::jsonb)
+        """),
+        {"id": eid, "uid": uid, "wid": item_id, "etype": event_type,
+         "sev": severity, "title": title, "details": json.dumps(details, ensure_ascii=False)},
+    )
+    await session.commit()
+    row = (await session.execute(
+        text("SELECT * FROM registry_watch_items WHERE id = :id LIMIT 1"), {"id": item_id}
+    )).mappings().first()
+    return {"status": "checked", "item": dict(row) if row else item,
+            "event_id": eid, "event_type": event_type}
+
+
+@app.get("/api/monitoring/events")
+async def get_monitoring_events(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20),
+    watch_item_id: str | None = Query(None),
+    severity: str | None = Query(None),
+    event_type: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    params: dict = {"uid": uid}
+    conditions = ["user_id = :uid"]
+    if watch_item_id:
+        conditions.append("watch_item_id = :wid")
+        params["wid"] = watch_item_id
+    if severity:
+        conditions.append("severity = :sev")
+        params["sev"] = severity
+    if event_type:
+        conditions.append("event_type = :etype")
+        params["etype"] = event_type
+    where = " AND ".join(conditions)
+    count_row = (await session.execute(
+        text(f"SELECT COUNT(*) FROM registry_events WHERE {where}"), params
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text(f"SELECT * FROM registry_events WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+        {**params, "lim": page_size, "off": offset},
+    )).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("details"), str):
+            try:
+                d["details"] = json.loads(d["details"])
+            except Exception:
+                d["details"] = {}
+        items.append(d)
+    return {"total": count_row, "page": page, "page_size": page_size,
+            "pages": max(1, -(-int(count_row) // page_size)), "items": items}
+
+
+@app.post("/api/monitoring/check-due")
+async def monitoring_check_due(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    limit = body.get("limit", 10)
+    due_rows = (await session.execute(
+        text("""
+            SELECT * FROM registry_watch_items
+            WHERE user_id = :uid AND status = 'active'
+              AND (next_check_at IS NULL OR next_check_at <= NOW())
+            ORDER BY next_check_at ASC NULLS FIRST
+            LIMIT :lim
+        """),
+        {"uid": uid, "lim": limit},
+    )).mappings().all()
+
+    checked = 0
+    state_changed = 0
+    for item in due_rows:
+        item_id = str(item["id"])
+        event_type = "state_unchanged"
+        if _ODB_KEY and item.get("registry_type") == "company":
+            try:
+                data = await _odb_get(f"/v1/company/{item['identifier']}")
+                prev = item.get("latest_snapshot") or {}
+                if isinstance(prev, str):
+                    try:
+                        prev = json.loads(prev)
+                    except Exception:
+                        prev = {}
+                if data.get("status") != prev.get("status"):
+                    event_type = "state_changed"
+                    state_changed += 1
+                await session.execute(
+                    text("UPDATE registry_watch_items SET last_checked_at=NOW(), latest_snapshot=:snap::jsonb, next_check_at=NOW() + (check_interval_hours || ' hours')::interval WHERE id=:id"),
+                    {"snap": json.dumps(data, ensure_ascii=False), "id": item_id},
+                )
+            except Exception:
+                pass
+        else:
+            await session.execute(
+                text("UPDATE registry_watch_items SET last_checked_at=NOW(), next_check_at=NOW() + (check_interval_hours || ' hours')::interval WHERE id=:id"),
+                {"id": item_id},
+            )
+        await session.execute(
+            text("INSERT INTO registry_events (id,user_id,watch_item_id,event_type,severity,title,details) VALUES (:id,:uid,:wid,:etype,'info',:title,'{}')"),
+            {"id": str(uuid.uuid4()), "uid": uid, "wid": item_id,
+             "etype": event_type, "title": f"Авто-перевірка: {item.get('entity_name', item['identifier'])}"},
+        )
+        checked += 1
+    await session.commit()
+    return {"status": "done", "scanned": len(due_rows), "checked": checked, "state_changed": state_changed}
+
+
+# ============================================================================
+# DOCUMENT VERSIONS — таблиця document_versions
+# ============================================================================
+
+@app.get("/api/documents/{doc_id}/versions")
+async def get_document_versions(
+    doc_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    # Verify ownership
+    doc = (await session.execute(
+        text("SELECT id FROM generated_documents WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": doc_id, "uid": uid},
+    )).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не знайдено")
+    count_row = (await session.execute(
+        text("SELECT COUNT(*) FROM document_versions WHERE document_id = :did"), {"did": doc_id}
+    )).scalar() or 0
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text("SELECT id, document_id, version_number, action, created_at FROM document_versions WHERE document_id = :did ORDER BY version_number DESC LIMIT :lim OFFSET :off"),
+        {"did": doc_id, "lim": page_size, "off": offset},
+    )).mappings().all()
+    return {"document_id": doc_id, "total": count_row, "page": page, "page_size": page_size,
+            "pages": max(1, -(-int(count_row) // page_size)), "items": [dict(r) for r in rows]}
+
+
+@app.get("/api/documents/{doc_id}/versions/{version_id}")
+async def get_document_version_detail(
+    doc_id: str,
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    row = (await session.execute(
+        text("SELECT * FROM document_versions WHERE id = :vid AND document_id = :did LIMIT 1"),
+        {"vid": version_id, "did": doc_id},
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Версія не знайдена")
+    return dict(row)
+
+
+@app.get("/api/documents/{doc_id}/versions/{version_id}/diff")
+async def get_document_version_diff(
+    doc_id: str,
+    version_id: str,
+    against: str = Query("current"),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    target = (await session.execute(
+        text("SELECT * FROM document_versions WHERE id = :vid AND document_id = :did LIMIT 1"),
+        {"vid": version_id, "did": doc_id},
+    )).mappings().first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Версія не знайдена")
+
+    if against == "current":
+        current_doc = (await session.execute(
+            text("SELECT generated_text FROM generated_documents WHERE id = :id LIMIT 1"),
+            {"id": doc_id},
+        )).first()
+        against_text = current_doc[0] if current_doc else ""
+        against_ver_num = None
+    else:
+        other = (await session.execute(
+            text("SELECT * FROM document_versions WHERE id = :vid AND document_id = :did LIMIT 1"),
+            {"vid": against, "did": doc_id},
+        )).mappings().first()
+        against_text = dict(other).get("generated_text", "") if other else ""
+        against_ver_num = dict(other).get("version_number") if other else None
+
+    target_lines = (target.get("generated_text") or "").splitlines()
+    against_lines = (against_text or "").splitlines()
+    added = sum(1 for l in target_lines if l not in against_lines)
+    removed = sum(1 for l in against_lines if l not in target_lines)
+    return {
+        "document_id": doc_id, "target_version_id": version_id,
+        "target_version_number": target.get("version_number"),
+        "against": against, "against_version_number": against_ver_num,
+        "diff_text": f"+{added} рядків, -{removed} рядків",
+        "added_lines": added, "removed_lines": removed,
+    }
+
+
+@app.post("/api/documents/{doc_id}/versions/{version_id}/restore")
+async def restore_document_version(
+    doc_id: str,
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    version_row = (await session.execute(
+        text("SELECT * FROM document_versions WHERE id = :vid AND document_id = :did LIMIT 1"),
+        {"vid": version_id, "did": doc_id},
+    )).mappings().first()
+    if not version_row:
+        raise HTTPException(status_code=404, detail="Версія не знайдена")
+
+    v = dict(version_row)
+    # Save current as new version before restoring
+    cur = (await session.execute(
+        text("SELECT generated_text FROM generated_documents WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": doc_id, "uid": uid},
+    )).first()
+    if not cur:
+        raise HTTPException(status_code=404, detail="Документ не знайдено")
+
+    max_ver = (await session.execute(
+        text("SELECT COALESCE(MAX(version_number), 0) FROM document_versions WHERE document_id = :did"),
+        {"did": doc_id},
+    )).scalar() or 0
+    new_ver = max_ver + 1
+    backup_id = str(uuid.uuid4())
+    await session.execute(
+        text("INSERT INTO document_versions (id, document_id, version_number, action, generated_text) VALUES (:id, :did, :ver, 'auto_backup', :text)"),
+        {"id": backup_id, "did": doc_id, "ver": new_ver, "text": cur[0]},
+    )
+    restore_ver = new_ver + 1
+    await session.execute(
+        text("UPDATE generated_documents SET generated_text = :text WHERE id = :id AND user_id = :uid"),
+        {"text": v.get("generated_text", ""), "id": doc_id, "uid": uid},
+    )
+    restore_id = str(uuid.uuid4())
+    await session.execute(
+        text("INSERT INTO document_versions (id, document_id, version_number, action, generated_text) VALUES (:id, :did, :ver, 'restore', :text)"),
+        {"id": restore_id, "did": doc_id, "ver": restore_ver, "text": v.get("generated_text", "")},
+    )
+    await session.commit()
+    await _audit_log(session, uid, "document_restore", "document", doc_id, {"from_version": version_id})
+    return {
+        "status": "restored", "id": doc_id,
+        "restored_from_version_id": version_id,
+        "restored_to_version_number": restore_ver,
+        "has_docx_export": False, "has_pdf_export": False,
+    }
+
+
+# ============================================================================
+# CASE-LAW SYNC — підтягуємо з OpenDataBot в case_law_items
+# ============================================================================
+
+@app.post("/api/case-law/sync")
+async def sync_case_law(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    query = body.get("query", "")
+    limit = min(int(body.get("limit", 5)), 10)
+    job_id = str(uuid.uuid4())
+    created = 0
+    updated = 0
+
+    if _ODB_KEY and query:
+        try:
+            data = await _odb_get("/v1/court/case", params={"number": query})
+            cases = data if isinstance(data, list) else [data]
+            for c in cases[:limit]:
+                decision_id = str(c.get("case_id", c.get("id", str(uuid.uuid4()))))
+                existing = (await session.execute(
+                    text("SELECT id FROM case_law_items WHERE decision_id = :did AND user_id = :uid LIMIT 1"),
+                    {"did": decision_id, "uid": uid},
+                )).first()
+                if existing:
+                    await session.execute(
+                        text("UPDATE case_law_items SET summary = :s, tags = :tags::jsonb WHERE decision_id = :did AND user_id = :uid"),
+                        {"s": str(c.get("subject", ""))[:500], "tags": "[]", "did": decision_id, "uid": uid},
+                    )
+                    updated += 1
+                else:
+                    await session.execute(
+                        text("""
+                            INSERT INTO case_law_items
+                                (id, user_id, source, decision_id, case_number, court_name, summary)
+                            VALUES (:id, :uid, 'opendatabot', :did, :cnum, :court, :summary)
+                        """),
+                        {
+                            "id": str(uuid.uuid4()), "uid": uid, "did": decision_id,
+                            "cnum": str(c.get("case_number", query)),
+                            "court": str(c.get("court_name", "")),
+                            "summary": str(c.get("subject", ""))[:500],
+                        },
+                    )
+                    created += 1
+            await session.commit()
+        except Exception as e:
+            print(f"[case-law/sync] error: {e}")
+
+    return {
+        "status": "done", "created": created, "updated": updated,
+        "total": created + updated, "sources": ["opendatabot"],
+        "seed_fallback_used": not bool(_ODB_KEY), "fetched_counts": {"opendatabot": created + updated},
+    }
+
+
+@app.post("/api/case-law/import")
+async def import_case_law(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    items = body.get("items", [])
+    created = 0
+    errors = []
+    for item in items[:50]:
+        try:
+            await session.execute(
+                text("""
+                    INSERT INTO case_law_items
+                        (id, user_id, source, decision_id, case_number, court_name,
+                         judge_name, decision_date, doc_type, summary, full_text, tags)
+                    VALUES
+                        (:id, :uid, :src, :did, :cnum, :court,
+                         :judge, :date, :dtype, :summary, :full_text, :tags::jsonb)
+                    ON CONFLICT DO NOTHING
+                """),
+                {
+                    "id": str(uuid.uuid4()), "uid": uid,
+                    "src": item.get("source", "manual"),
+                    "did": item.get("decision_id", str(uuid.uuid4())),
+                    "cnum": item.get("case_number"),
+                    "court": item.get("court_name"),
+                    "judge": item.get("judge_name"),
+                    "date": item.get("decision_date"),
+                    "dtype": item.get("doc_type"),
+                    "summary": item.get("summary", "")[:1000],
+                    "full_text": item.get("full_text", ""),
+                    "tags": json.dumps(item.get("tags", []), ensure_ascii=False),
+                },
+            )
+            created += 1
+        except Exception as e:
+            errors.append(str(e))
+    await session.commit()
+    return {"imported": created, "skipped": len(items) - created, "errors": errors[:5]}
+
+
+@app.post("/api/case-law/digest/generate")
+async def generate_case_law_digest(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    query = body.get("query", "")
+    # Pull recent items from case_law_items
+    rows = (await session.execute(
+        text("SELECT case_number, court_name, summary FROM case_law_items WHERE user_id = :uid ORDER BY created_at DESC LIMIT 20"),
+        {"uid": uid},
+    )).mappings().all()
+    items_text = "\n".join([f"- {r.get('case_number')}: {r.get('summary', '')}" for r in rows])
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if api_key and rows:
+        prompt = f"Склади короткий юридичний дайджест на основі цих справ:\n{items_text}\nЗапит: {query}\nПоверни JSON: {{\"title\": \"...\", \"summary\": \"...\"}}"
+        result = await _ai_json(prompt, max_tokens=1024)
+        title = result.get("title", f"Дайджест — {datetime.utcnow().strftime('%d.%m.%Y')}") if result else f"Дайджест"
+        summary = result.get("summary", items_text[:500]) if result else items_text[:500]
+    else:
+        title = f"Дайджест — {datetime.utcnow().strftime('%d.%m.%Y')}"
+        summary = items_text[:500] or "Немає даних у базі судової практики."
+
+    did = str(uuid.uuid4())
+    await session.execute(
+        text("INSERT INTO case_law_digest (id, user_id, title, summary, query, items_count) VALUES (:id, :uid, :title, :summary, :query, :count)"),
+        {"id": did, "uid": uid, "title": title, "summary": summary, "query": query, "count": len(rows)},
+    )
+    await session.commit()
+    return {"id": did, "user_id": uid, "title": title, "summary": summary,
+            "source": "ai" if api_key else "manual", "query": query,
+            "items_count": len(rows), "created_at": datetime.utcnow().isoformat()}
+
+
+# ============================================================================
+# DOCUMENT EXPORT (DOCX)
+# ============================================================================
+
+@app.get("/api/documents/{doc_id}/export/docx")
+async def export_document_docx(
+    doc_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    row = (await session.execute(
+        text("SELECT * FROM generated_documents WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": doc_id, "uid": uid},
+    )).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Документ не знайдено")
+    doc = dict(row)
+
+    try:
+        from docx import Document as DocxDocument  # noqa: PLC0415
+        from io import BytesIO  # noqa: PLC0415
+        from fastapi.responses import Response  # noqa: PLC0415
+
+        d = DocxDocument()
+        d.add_heading(doc.get("title") or doc.get("document_type", "Документ"), 0)
+        text_content = doc.get("generated_text", "")
+        for paragraph in text_content.split("\n"):
+            if paragraph.strip():
+                d.add_paragraph(paragraph)
+        buf = BytesIO()
+        d.save(buf)
+        buf.seek(0)
+        filename = f"{doc.get('title', 'document')}.docx".replace("/", "_")
+        return Response(
+            content=buf.read(),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+        )
+    except ImportError:
+        raise HTTPException(status_code=501, detail="python-docx не встановлено. Додайте python-docx до requirements.txt")
 
 
 if __name__ == "__main__":
