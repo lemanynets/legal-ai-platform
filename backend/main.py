@@ -2805,19 +2805,6 @@ async def get_ecourt_hearings(
     return {"items": [], "total": 0}
 
 
-@app.post("/api/e-court/submit")
-async def submit_to_ecourt(
-    body: dict,
-    current_user: dict = Depends(get_current_user),
-):
-    return {
-        "status": "submitted",
-        "tracking_id": str(uuid.uuid4()),
-        "message": "Заяву надіслано до Е-Суд (demo режим). Налаштуйте інтеграцію з реальним API судів.",
-        "submitted_at": datetime.utcnow().isoformat(),
-    }
-
-
 # ============================================================================
 # KNOWLEDGE BASE  (/api/knowledge-base/*)
 # ============================================================================
@@ -2844,7 +2831,6 @@ async def create_knowledge_entry(
         await session.commit()
     except Exception as e:
         print(f"[knowledge-base] DB error: {e}")
-        # Table might not exist yet — return stub
         return {"id": kid, "user_id": uid, "title": title, "content": content,
                 "category": category, "created_at": datetime.utcnow().isoformat()}
     return {"id": kid, "user_id": uid, "title": title, "content": content,
@@ -2870,52 +2856,7 @@ async def delete_knowledge_entry(
 
 
 # ============================================================================
-# MONITORING  (/api/monitoring/*)
-# ============================================================================
-
-@app.get("/api/monitoring/watch-items")
-async def get_watch_items(current_user: dict = Depends(get_current_user)):
-    return {"items": []}
-
-
-@app.post("/api/monitoring/watch-items")
-async def create_watch_item(body: dict, current_user: dict = Depends(get_current_user)):
-    uid = str(current_user["id"])
-    return {"id": str(uuid.uuid4()), "user_id": uid, **body,
-            "created_at": datetime.utcnow().isoformat()}
-
-
-@app.post("/api/monitoring/check-due")
-async def monitoring_check_due(current_user: dict = Depends(get_current_user)):
-    return {"checked": 0, "alerts": []}
-
-
-# ============================================================================
-# CASE-LAW (missing endpoints)
-# ============================================================================
-
-@app.post("/api/case-law/import")
-async def import_case_law(body: dict, current_user: dict = Depends(get_current_user)):
-    return {"imported": 0, "skipped": 0, "errors": []}
-
-
-@app.post("/api/case-law/sync")
-async def sync_case_law(body: dict, current_user: dict = Depends(get_current_user)):
-    return {"status": "started", "job_id": str(uuid.uuid4())}
-
-
-@app.get("/api/case-law/sync/status")
-async def get_sync_status(job_id: str = Query(""), current_user: dict = Depends(get_current_user)):
-    return {"status": "done", "job_id": job_id, "imported": 0}
-
-
-@app.post("/api/case-law/digest/generate")
-async def generate_digest(body: dict, current_user: dict = Depends(get_current_user)):
-    return {"items": [], "generated_at": datetime.utcnow().isoformat()}
-
-
-# ============================================================================
-# TEAM / AUTH (missing endpoints)
+# TEAM / AUTH
 # ============================================================================
 
 @app.get("/api/auth/team/users")
@@ -2942,23 +2883,6 @@ async def update_team_user_role(
         except Exception:
             pass
     return {"status": "ok"}
-
-
-# ============================================================================
-# CALCULATIONS (missing)
-# ============================================================================
-
-@app.post("/api/calculate/full")
-async def calculate_full(body: dict, current_user: dict = Depends(get_current_user)):
-    principal = float(body.get("principal", 0))
-    rate = float(body.get("rate", 0.3))
-    days = int(body.get("days", 0))
-    penalty = principal * rate / 365 * days
-    return {
-        "principal": principal, "penalty": penalty, "total": principal + penalty,
-        "breakdown": {"rate": rate, "days": days},
-        "calculated_at": datetime.utcnow().isoformat(),
-    }
 
 
 # ============================================================================
