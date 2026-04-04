@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /c/Users/ja/Documents/legal-ai-platform/backend/app/routers/*.py)",
+      "Bash(wc -l /c/Users/ja/Documents/legal-ai-platform/frontend/app/**/*.tsx)",
+      "Bash(railway logs:*)",
+      "Bash(railway run:*)",
+      "Bash(python -c \":*)",
+      "Bash(curl -skL \"https://api.opendatabot.com/v2/court-cases/307%2F5062%2F25?apiKey=hV4cj3CDkL\" -H \"Accept: application/json\" -w \"\\\\nHTTP: %{http_code}\")",
+      "Bash(curl -skL \"https://api.opendatabot.ua/court?number=307/5062/25&apiKey=hV4cj3CDkL\" -H \"Accept: application/json\" -w \"\\\\nHTTP: %{http_code}\")",
+      "Bash(curl -skL \"https://api.opendatabot.ua/v2/court?number=307/5062/25&apiKey=hV4cj3CDkL\" -H \"Accept: application/json\" -w \"\\\\nHTTP: %{http_code}\")",
+      "Bash(railway variables:*)"
+    ]
+  }
+}

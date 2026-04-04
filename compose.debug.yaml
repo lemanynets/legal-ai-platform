@@ -1,0 +1,6 @@
+services:
+  legalaiplatform:
+    image: legalaiplatform
+    build:
+      context: .
+      dockerfile: ./Dockerfile

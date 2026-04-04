@@ -1,0 +1,76 @@
+warning: in the working copy of 'backend/app/auth.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/catalog.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/config.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/models/__init__.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/models/generated_document.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/models/legal_strategy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/models/user.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/analyze.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/auth.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/auto_process.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/billing.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/documents.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/opendatabot.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/routers/strategy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/ai_generator.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/contract_analyses.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/document_export.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/entitlements.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/file_text_extractor.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/generated_documents.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/legal_strategy.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/legal_strategy_ai.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/opendatabot_client.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/prompt_builder.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/app/services/subscriptions.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/requirements.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_ai_generator.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/upgrade_user.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docker-compose.yml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/components/AppShell.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/analyze/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/auto-process/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/billing/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/calendar/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/decision-analysis/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/documents/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/full-lawyer/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/generate/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/registries/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/dashboard/strategy-studio/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/globals.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/layout.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/login/page.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/app/theme.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/lib/api.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/lib/auth.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/package-lock.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/tsconfig.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'task.md', LF will be replaced by CRLF the next time Git touches it
+ backend/app/auth.py                               |    8 [32m+[m
+ backend/app/catalog.py                            |   82 [32m+[m[31m-[m
+ backend/app/config.py                             |   25 [32m+[m[31m-[m
+ backend/app/main.py                               |   51 [32m+[m[31m-[m
+ backend/app/models/__init__.py                    |    5 [32m+[m
+ backend/app/models/generated_document.py          |    2 [32m+[m
+ backend/app/models/legal_strategy.py              |    6 [32m+[m[31m-[m
+ backend/app/models/user.py                        |   15 [32m+[m[31m-[m
+ backend/app/routers/analyze.py                    |    7 [32m+[m[31m-[m
+ backend/app/routers/auth.py                       |  137 [32m+[m[31m-[m
+ backend/app/routers/auto_process.py               |  303 [32m++[m[31m-[m
+ backend/app/routers/billing.py                    |    6 [32m+[m
+ backend/app/routers/documents.py                  |  386 [32m++[m[31m--[m
+ backend/app/routers/opendatabot.py                |  153 [32m+[m[31m-[m
+ backend/app/routers/strategy.py                   |  243 [32m++[m[31m-[m
+ backend/app/schemas.py                            | 2053 [31m---------------------[m
+ backend/app/services/ai_generator.py              |  592 [32m+++++[m[31m-[m
+ backend/app/services/auto_processor.py            |   24 [32m+[m[31m-[m
+ backend/app/services/contract_analyses.py         |  147 [32m+[m[31m-[m
+ backend/app/services/document_export.py           |   56 [32m+[m[31m-[m
+ backend/app/services/entitlements.py              |    2 [32m+[m[31m-[m
+ backend/app/services/file_text_extractor.py       |   18 [32m+[m[31m-[m
+ backend/app/services/generated_documents.py       |    5 [32m+[m
+ backend/app/services/legal_strategy.py            |  614 [32m++++[m[31m--[m
+ backend/app/services/legal_strategy_ai.py         |    8 [32m+[m[31m-[m
+ backend/app/services/op

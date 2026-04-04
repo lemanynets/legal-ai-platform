@@ -1,0 +1,10 @@
+starting analyze trace
+importing fastapi
+importing sqlalchemy
+importing app.auth
+importing app.database
+importing app.schemas
+importing app.services.audit
+importing app.services.contract_analyses
+importing app.services.subscriptions
+done analyzing imports

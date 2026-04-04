@@ -1,0 +1,4 @@
+interface:
+  display_name: "UK Legal 3-Agent Pipeline"
+  short_description: "Build UK legal 3-agent pipeline"
+  default_prompt: "Use $uk-legal-three-agent-pipeline to implement or refine the intake-to-precedent-to-strategy pipeline in this repo."

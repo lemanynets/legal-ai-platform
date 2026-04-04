@@ -1,0 +1,32 @@
+FILE P1: C:/Users/ja/Desktop/суд/Покорба М.М/Єдиний державний реєстр судових рішень.pdf
+TOTAL_LEN 13285
+PREVIEW Категорія справи № 307/256/21: Кримінальні справи (з 01.01.2019); Провадження за поданням правоохоронних органів, за клопотанням слідчого, прокурора та інших осіб про; арешт майна. Надіслано судом: 23.09.2021. Зареєстров
+pypdf 13285
+pdfminer 14044
+pdftotext 0
+ocr ERR PDFInfoNotInstalledError('Unable to get page count. Is poppler installed and in PATH?')
+---
+FILE P2: C:/Users/ja/Desktop/суд/Лазур В.В/Єдиний державний реєстр судових рішень.pdf
+TOTAL_LEN 6983
+PREVIEW Категорія справи № 307/1875/25: Справи про адмінправопорушення (з 01.01.2019); Адміністративні правопорушення на транспорті, в галузі шляхового господарства і зв’язку; Керування транспортним засобом особою, яка не має ві
+pypdf 6983
+pdfminer 7390
+pdftotext 0
+ocr ERR PDFInfoNotInstalledError('Unable to get page count. Is poppler installed and in PATH?')
+---
+FILE P3: C:/Users/ja/Desktop/суд/Покорба М.М/Скановані документи.pdf
+TOTAL_LEN 0
+PREVIEW 
+pypdf 0
+pdfminer 0
+pdftotext 0
+ocr ERR PDFInfoNotInstalledError('Unable to get page count. Is poppler installed and in PATH?')
+---
+FILE P4: C:/Users/ja/Downloads/Telegram Desktop/Скановані документи.pdf
+TOTAL_LEN 0
+PREVIEW 
+pypdf 0
+pdfminer 0
+pdftotext 0
+ocr ERR PDFInfoNotInstalledError('Unable to get page count. Is poppler installed and in PATH?')
+---
