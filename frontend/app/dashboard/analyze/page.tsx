@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import React, { FormEvent, Suspense, useEffect, useState } from "react";
 
 import { getToken, getUserId } from "@/lib/auth";
@@ -339,7 +339,6 @@ async function runWithConcurrency<T>(
 }
 
 function AnalyzePageInner() {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const mode = searchParams.get("mode") || "quick";
 
@@ -599,14 +598,13 @@ function AnalyzePageInner() {
           { key: "quick", label: "Швидкий аналіз" },
           { key: "litigation", label: "Судовий аналіз" },
         ].map(({ key, label }) => (
-          <button
+          <Link
             key={key}
-            onClick={() => router.push(`/dashboard/analyze?mode=${key}`)}
+            href={`/dashboard/analyze?mode=${key}`}
             style={{
+              display: "inline-block",
               padding: "10px 20px",
-              background: "none",
-              border: "none",
-              cursor: "pointer",
+              textDecoration: "none",
               fontSize: "14px",
               fontWeight: mode === key ? 700 : 400,
               color: mode === key ? "var(--gold-400)" : "var(--text-secondary)",
@@ -616,7 +614,7 @@ function AnalyzePageInner() {
             }}
           >
             {label}
-          </button>
+          </Link>
         ))}
       </div>
 

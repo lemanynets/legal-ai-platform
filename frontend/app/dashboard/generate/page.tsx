@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
 
 import { getSession, getToken, getUserId } from "@/lib/auth";
@@ -85,7 +85,6 @@ function SummaryStat({ label, value }: { label: string; value: string | number }
 
 function GeneratePageInner() {
   const searchParams = useSearchParams();
-  const router = useRouter();
   const [docTypes, setDocTypes] = useState<DocumentType[]>([]);
   const [selectedDocType, setSelectedDocType] = useState("");
   const [schema, setSchema] = useState<FormField[]>([]);
@@ -516,17 +515,14 @@ function GeneratePageInner() {
           { key: "single", label: "Документ" },
           { key: "package", label: "Пакет" },
         ].map(({ key, label }) => (
-          <button
+          <Link
             key={key}
-            onClick={() => {
-              router.push(`/dashboard/generate?mode=${key}`);
-              setIsBundleMode(key === "package");
-            }}
+            href={`/dashboard/generate?mode=${key}`}
+            onClick={() => setIsBundleMode(key === "package")}
             style={{
+              display: "inline-block",
               padding: "10px 20px",
-              background: "none",
-              border: "none",
-              cursor: "pointer",
+              textDecoration: "none",
               fontSize: "14px",
               fontWeight: isPackageMode === (key === "package") ? 700 : 400,
               color: isPackageMode === (key === "package") ? "var(--gold-400)" : "var(--text-secondary)",
@@ -536,7 +532,7 @@ function GeneratePageInner() {
             }}
           >
             {label}
-          </button>
+          </Link>
         ))}
       </div>
 
