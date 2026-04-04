@@ -83,10 +83,13 @@ _rate_limiter = _RateLimiter()
 
 # Rules: (path_prefix, requests_per_minute)
 _RATE_RULES: list[tuple[str, int]] = [
-    ("/api/analyze/",         10),
-    ("/api/auto/",            10),
-    ("/api/strategy/",        10),
-    ("/api/documents/generate", 5),
+    ("/api/analyze/",            10),
+    ("/api/auto/",               10),
+    ("/api/strategy/",           10),
+    ("/api/documents/generate",   5),
+    ("/api/auth/login",          10),   # brute-force захист
+    ("/api/auth/register",       10),
+    ("/api/auth/kep/",           20),   # КЕП має більший ліміт (challenge+verify = 2 req)
 ]
 
 @app.middleware("http")
@@ -113,6 +116,10 @@ async def rate_limit_middleware(request: Request, call_next):  # type: ignore[ty
                 )
             break  # only apply first matching rule
     return await call_next(request)
+
+# ── Routers ───────────────────────────────────────────────────────────────────
+from routers.kep import router as kep_router  # noqa: E402
+app.include_router(kep_router)
 
 # ── Startup: create tables ────────────────────────────────────────────────────
 @app.on_event("startup")
