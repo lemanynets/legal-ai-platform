@@ -14,7 +14,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import asyncio
@@ -332,10 +332,14 @@ _MIGRATIONS = [
         used_at TIMESTAMPTZ,
         ip TEXT,
         user_agent TEXT,
+        origin TEXT,
+        ua_hash TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_auth_challenges_used_at ON auth_challenges(used_at)",
+    "ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS origin TEXT",
+    "ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS ua_hash TEXT",
     """CREATE TABLE IF NOT EXISTS user_kep_identities (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -365,6 +369,10 @@ _SECRET = os.getenv("SECRET_KEY", "dev-secret-change-me")
 ALLOW_DEV_AUTH = os.getenv("ALLOW_DEV_AUTH", "false").lower() == "true"
 _bearer = HTTPBearer(auto_error=False)
 _RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+KEP_ALLOWED_PURPOSES = {"login", "link"}
+KEP_ALLOWED_PROVIDERS = {"local_key", "cloud_sign"}
+KEP_CHALLENGE_TTL_SECONDS = 180
+KEP_ISSUED_AT_MAX_SKEW_SECONDS = 300
 
 
 def _check_rate_limit(key: str, limit: int, window_seconds: int) -> None:
@@ -531,9 +539,32 @@ def _make_nonce() -> str:
     return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
 
 
+def _safe_b64_decode(value: str) -> bytes:
+    padded = value + ("=" * (-len(value) % 4))
+    try:
+        return base64.urlsafe_b64decode(padded.encode())
+    except Exception:
+        return base64.b64decode(padded.encode())
+
+
+def _ua_hash(user_agent: str) -> str:
+    return hashlib.sha256((user_agent or "").encode("utf-8")).hexdigest()
+
+
+def _origin_from_request(request: Request) -> str:
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        return origin
+    host = request.headers.get("host", "").strip()
+    if host:
+        proto = request.headers.get("x-forwarded-proto", "https").strip() or "https"
+        return f"{proto}://{host}"
+    return "unknown"
+
+
 def _decode_signed_payload(payload: str) -> dict:
     try:
-        decoded = base64.b64decode(payload).decode("utf-8")
+        decoded = _safe_b64_decode(payload).decode("utf-8")
         data = json.loads(decoded)
         if isinstance(data, dict):
             return data
@@ -542,10 +573,32 @@ def _decode_signed_payload(payload: str) -> dict:
     return {}
 
 
-async def _verify_kep_with_provider(body: KepVerifyRequest, nonce: str, challenge_id: str) -> tuple[bool, dict]:
+async def _verify_kep_with_provider(
+    body: KepVerifyRequest,
+    nonce: str,
+    challenge_id: str,
+    expected_origin: str,
+    expected_ua_hash: str,
+    expected_purpose: str,
+) -> tuple[bool, dict]:
     payload = _decode_signed_payload(body.signed_payload)
     if payload.get("nonce") != nonce or payload.get("challenge_id") != challenge_id:
         return False, {"reason": "payload_nonce_mismatch"}
+    if payload.get("origin") != expected_origin:
+        return False, {"reason": "payload_origin_mismatch"}
+    if payload.get("ua_hash") != expected_ua_hash:
+        return False, {"reason": "payload_ua_mismatch"}
+    if payload.get("purpose") != expected_purpose:
+        return False, {"reason": "payload_purpose_mismatch"}
+    issued_at_raw = str(payload.get("issued_at") or "").strip()
+    try:
+        issued_at = datetime.fromisoformat(issued_at_raw.replace("Z", "+00:00"))
+        if issued_at.tzinfo is not None:
+            issued_at = issued_at.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return False, {"reason": "payload_issued_at_invalid"}
+    if abs((datetime.utcnow() - issued_at).total_seconds()) > KEP_ISSUED_AT_MAX_SKEW_SECONDS:
+        return False, {"reason": "payload_issued_at_skew"}
     if not body.signature or not body.certificate:
         return False, {"reason": "empty_signature_or_certificate"}
 
@@ -640,18 +693,42 @@ async def create_kep_challenge(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ):
+    if body.purpose not in KEP_ALLOWED_PURPOSES:
+        raise HTTPException(status_code=400, detail={"error_code": "KEP_PURPOSE_INVALID", "message": "Непідтримуваний purpose."})
+    if body.provider not in KEP_ALLOWED_PROVIDERS:
+        raise HTTPException(status_code=400, detail={"error_code": "KEP_PROVIDER_INVALID", "message": "Непідтримуваний провайдер КЕП."})
     ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
     _check_rate_limit(f"kep:challenge:ip:{ip}", limit=10, window_seconds=60)
     nonce = _make_nonce()
     challenge_id = str(uuid.uuid4())
-    expires_at = datetime.utcnow() + timedelta(minutes=3)
+    expires_at = datetime.utcnow() + timedelta(seconds=KEP_CHALLENGE_TTL_SECONDS)
     ua = request.headers.get("user-agent", "")
+    origin = _origin_from_request(request)
+    ua_digest = _ua_hash(ua)
+    issued_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    challenge_payload = {
+        "challenge_id": challenge_id,
+        "nonce": nonce,
+        "purpose": body.purpose,
+        "origin": origin,
+        "ua_hash": ua_digest,
+        "issued_at": issued_at,
+    }
     await session.execute(
         text("""
-            INSERT INTO auth_challenges (id, nonce, purpose, expires_at, ip, user_agent)
-            VALUES (:id, :nonce, :purpose, :expires_at, :ip, :ua)
+            INSERT INTO auth_challenges (id, nonce, purpose, expires_at, ip, user_agent, origin, ua_hash)
+            VALUES (:id, :nonce, :purpose, :expires_at, :ip, :ua, :origin, :ua_hash)
         """),
-        {"id": challenge_id, "nonce": nonce, "purpose": body.purpose or "login", "expires_at": expires_at, "ip": ip, "ua": ua},
+        {
+            "id": challenge_id,
+            "nonce": nonce,
+            "purpose": body.purpose,
+            "expires_at": expires_at,
+            "ip": ip,
+            "ua": ua,
+            "origin": origin,
+            "ua_hash": ua_digest,
+        },
     )
     await _audit_log(session, "system", "kep_challenge_created", "auth_challenge", challenge_id, {"provider": body.provider, "purpose": body.purpose, "ip": ip})
     await session.commit()
@@ -660,6 +737,7 @@ async def create_kep_challenge(
         "nonce": nonce,
         "expires_at": expires_at.isoformat() + "Z",
         "algorithms": ["RSA-PSS-SHA256", "ECDSA-SHA256"],
+        "challenge_payload": challenge_payload,
     }
 
 
@@ -678,7 +756,7 @@ async def verify_kep_auth(
     row = (
         await session.execute(
             text("""
-                SELECT id, nonce, purpose, expires_at, used_at
+                SELECT id, nonce, purpose, expires_at, used_at, origin, ua_hash
                 FROM auth_challenges
                 WHERE id = :id
                 LIMIT 1
@@ -691,11 +769,24 @@ async def verify_kep_auth(
         await session.commit()
         raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_NOT_FOUND", "message": "Challenge не знайдено."})
     if row.get("used_at"):
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "challenge_replay", "ip": ip})
+        await session.commit()
         raise HTTPException(status_code=401, detail={"error_code": "KEP_REPLAY_DETECTED", "message": "Challenge вже був використаний."})
     if row.get("expires_at") and row["expires_at"] < datetime.utcnow():
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "challenge_expired", "ip": ip})
+        await session.commit()
         raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_EXPIRED", "message": "Challenge протермінований."})
+    if str(row.get("purpose") or "login") != "login":
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_PURPOSE_MISMATCH", "message": "Невірний тип challenge для входу."})
 
-    ok, provider_data = await _verify_kep_with_provider(body, str(row["nonce"]), body.challenge_id)
+    ok, provider_data = await _verify_kep_with_provider(
+        body,
+        str(row["nonce"]),
+        body.challenge_id,
+        str(row.get("origin") or _origin_from_request(request)),
+        str(row.get("ua_hash") or _ua_hash(request.headers.get("user-agent", ""))),
+        "login",
+    )
     if not ok:
         await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": provider_data.get("reason", "verify_failed"), "ip": ip})
         await session.commit()
@@ -770,9 +861,10 @@ async def link_kep_identity(
     session: AsyncSession = Depends(get_session),
 ):
     ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
+    _check_rate_limit(f"kep:link:ip:{ip}", limit=5, window_seconds=60)
     row = (
         await session.execute(
-            text("SELECT id, nonce, expires_at, used_at FROM auth_challenges WHERE id = :id LIMIT 1"),
+            text("SELECT id, nonce, purpose, expires_at, used_at, origin, ua_hash FROM auth_challenges WHERE id = :id LIMIT 1"),
             {"id": body.challenge_id},
         )
     ).mappings().first()
@@ -780,7 +872,16 @@ async def link_kep_identity(
         raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_NOT_FOUND", "message": "Challenge не знайдено."})
     if row.get("used_at") or (row.get("expires_at") and row["expires_at"] < datetime.utcnow()):
         raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_INVALID", "message": "Challenge недійсний."})
-    ok, provider_data = await _verify_kep_with_provider(body, str(row["nonce"]), body.challenge_id)
+    if str(row.get("purpose") or "login") != "link":
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_PURPOSE_MISMATCH", "message": "Невірний тип challenge для прив'язки."})
+    ok, provider_data = await _verify_kep_with_provider(
+        body,
+        str(row["nonce"]),
+        body.challenge_id,
+        str(row.get("origin") or _origin_from_request(request)),
+        str(row.get("ua_hash") or _ua_hash(request.headers.get("user-agent", ""))),
+        "link",
+    )
     if not ok:
         await _audit_log(session, str(current_user["id"]), "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": provider_data.get("reason", "verify_failed"), "ip": ip})
         await session.commit()

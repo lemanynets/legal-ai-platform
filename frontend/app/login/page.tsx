@@ -20,11 +20,9 @@ export default function LoginPage() {
     setError("");
     try {
       const challenge = await createKepChallenge({ provider: "local_key", purpose: "login" });
-      const signedPayload = btoa(JSON.stringify({
-        challenge_id: challenge.challenge_id,
-        nonce: challenge.nonce,
-        issued_at: new Date().toISOString(),
-      }));
+      const payloadJson = JSON.stringify(challenge.challenge_payload);
+      const payloadBytes = new TextEncoder().encode(payloadJson);
+      const signedPayload = btoa(String.fromCharCode(...payloadBytes));
       // NOTE: real integration should call a KEP SDK/provider here.
       const placeholderSignature = btoa(`${challenge.nonce}:signed`);
       const placeholderCertificate = btoa("demo-kep-certificate");

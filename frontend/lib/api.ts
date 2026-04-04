@@ -3659,6 +3659,14 @@ export type KepChallengeResponse = {
   nonce: string;
   expires_at: string;
   algorithms: string[];
+  challenge_payload: {
+    challenge_id: string;
+    nonce: string;
+    purpose: "login" | "link";
+    origin: string;
+    ua_hash: string;
+    issued_at: string;
+  };
 };
 
 export type KepVerifyResponse = {
