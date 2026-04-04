@@ -3654,6 +3654,82 @@ export async function getUserInfo(
   return request("/api/auth/me", { token, demoUser });
 }
 
+export type KepChallengeResponse = {
+  challenge_id: string;
+  nonce: string;
+  expires_at: string;
+  algorithms: string[];
+  challenge_payload: {
+    challenge_id: string;
+    nonce: string;
+    purpose: "login" | "link";
+    origin: string;
+    ua_hash: string;
+    issued_at: string;
+  };
+};
+
+export type KepVerifyResponse = {
+  access_token: string;
+  token_type: "bearer";
+  user: {
+    id: string;
+    email: string;
+    name: string;
+  };
+};
+
+export async function createKepChallenge(
+  payload: { provider: string; purpose?: "login" | "link" },
+  token?: string,
+  demoUser?: string
+): Promise<KepChallengeResponse> {
+  return request<KepChallengeResponse>("/api/auth/kep/challenge", {
+    method: "POST",
+    body: payload,
+    token,
+    demoUser
+  });
+}
+
+export async function verifyKepAuth(
+  payload: {
+    challenge_id: string;
+    signature: string;
+    signed_payload: string;
+    certificate: string;
+    provider: string;
+  },
+  token?: string,
+  demoUser?: string
+): Promise<KepVerifyResponse> {
+  return request<KepVerifyResponse>("/api/auth/kep/verify", {
+    method: "POST",
+    body: payload,
+    token,
+    demoUser
+  });
+}
+
+export async function linkKepIdentity(
+  payload: {
+    challenge_id: string;
+    signature: string;
+    signed_payload: string;
+    certificate: string;
+    provider?: string;
+  },
+  token?: string,
+  demoUser?: string
+): Promise<{ status: string; cert_fingerprint: string }> {
+  return request<{ status: string; cert_fingerprint: string }>("/api/auth/kep/link", {
+    method: "POST",
+    body: payload,
+    token,
+    demoUser
+  });
+}
+
 export async function updateUserInfo(
   payload: { logo_url?: string; full_name?: string; company?: string; entity_type?: string; tax_id?: string; address?: string; phone?: string; },
   token?: string,
