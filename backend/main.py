@@ -141,6 +141,8 @@ _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS logo_url TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS kep_serial TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_kep_serial ON users(kep_serial) WHERE kep_serial IS NOT NULL",
     """CREATE TABLE IF NOT EXISTS subscriptions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1437,18 +1439,23 @@ async def get_case_law_digest(
         conditions.append("(title ILIKE :q OR summary ILIKE :q)")
         params["q"] = f"%{q}%"
     where = " AND ".join(conditions)
-    count_row = (await session.execute(
-        text(f"SELECT COUNT(*) FROM case_law_digest WHERE {where}"), params
-    )).scalar() or 0
-    offset = (page - 1) * page_size
-    rows = (await session.execute(
-        text(f"SELECT * FROM case_law_digest WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
-        {**params, "lim": page_size, "off": offset},
-    )).mappings().all()
+    try:
+        count_row = (await session.execute(
+            text(f"SELECT COUNT(*) FROM case_law_digest WHERE {where}"), params
+        )).scalar() or 0
+        offset = (page - 1) * page_size
+        rows = (await session.execute(
+            text(f"SELECT * FROM case_law_digest WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+            {**params, "lim": page_size, "off": offset},
+        )).mappings().all()
+        items = [dict(r) for r in rows]
+    except Exception:
+        await session.rollback()
+        count_row, items = 0, []
     return {
         "total": count_row, "page": page, "page_size": page_size,
         "pages": max(1, -(-int(count_row) // page_size)),
-        "items": [dict(r) for r in rows],
+        "items": items,
     }
 
 
@@ -1460,16 +1467,21 @@ async def get_digest_history(
     session: AsyncSession = Depends(get_session),
 ):
     uid = str(current_user["id"])
-    count_row = (await session.execute(
-        text("SELECT COUNT(*) FROM case_law_digest WHERE user_id = :uid"), {"uid": uid}
-    )).scalar() or 0
-    offset = (page - 1) * page_size
-    rows = (await session.execute(
-        text("SELECT * FROM case_law_digest WHERE user_id = :uid ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
-        {"uid": uid, "lim": page_size, "off": offset},
-    )).mappings().all()
+    try:
+        count_row = (await session.execute(
+            text("SELECT COUNT(*) FROM case_law_digest WHERE user_id = :uid"), {"uid": uid}
+        )).scalar() or 0
+        offset = (page - 1) * page_size
+        rows = (await session.execute(
+            text("SELECT * FROM case_law_digest WHERE user_id = :uid ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+            {"uid": uid, "lim": page_size, "off": offset},
+        )).mappings().all()
+        items = [dict(r) for r in rows]
+    except Exception:
+        await session.rollback()
+        count_row, items = 0, []
     return {"total": count_row, "page": page, "page_size": page_size,
-            "pages": max(1, -(-int(count_row) // page_size)), "items": [dict(r) for r in rows]}
+            "pages": max(1, -(-int(count_row) // page_size)), "items": items}
 
 
 @app.get("/api/case-law/digest/history/{digest_id}")
