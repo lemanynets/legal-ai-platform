@@ -19,11 +19,12 @@ from typing import Any, Optional
 import asyncio
 import pathlib
 import time
+from collections import defaultdict
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -52,6 +53,60 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Rate limiting (in-memory sliding window, per IP) ─────────────────────────
+class _RateLimiter:
+    """Thread-safe in-memory sliding-window rate limiter.
+
+    Stores per-key timestamp lists.  Old entries are pruned on each call so
+    memory stays bounded.  Not suitable for multi-process deployments (use
+    Redis in that case), but fine for single-process Railway services.
+    """
+
+    def __init__(self) -> None:
+        self._windows: dict[str, list[float]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+
+    async def is_allowed(self, key: str, limit: int, window: int = 60) -> bool:
+        now = time.monotonic()
+        async with self._lock:
+            ts = self._windows[key]
+            # prune expired
+            cutoff = now - window
+            self._windows[key] = [t for t in ts if t > cutoff]
+            if len(self._windows[key]) >= limit:
+                return False
+            self._windows[key].append(now)
+            return True
+
+_rate_limiter = _RateLimiter()
+
+# Rules: (path_prefix, requests_per_minute)
+_RATE_RULES: list[tuple[str, int]] = [
+    ("/api/analyze/",         10),
+    ("/api/auto/",            10),
+    ("/api/strategy/",        10),
+    ("/api/documents/generate", 5),
+]
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):  # type: ignore[type-arg]
+    path = request.url.path
+    ip = request.client.host if request.client else "unknown"
+    for prefix, limit in _RATE_RULES:
+        if path.startswith(prefix):
+            key = f"{ip}:{prefix}"
+            allowed = await _rate_limiter.is_allowed(key, limit)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": f"Забагато запитів. Максимум {limit} запитів/хв для {prefix}. Спробуйте пізніше."
+                    },
+                    headers={"Retry-After": "60"},
+                )
+            break  # only apply first matching rule
+    return await call_next(request)
 
 # ── Startup: create tables ────────────────────────────────────────────────────
 @app.on_event("startup")
