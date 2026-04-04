@@ -27,8 +27,10 @@ const BACKEND_URL =
 
 // Типи для IIT EndUser JS (глобальна змінна після завантаження скрипта)
 declare global {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const EndUser: any;
+  interface Window {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    EndUser: any;
+  }
 }
 
 interface KepLoginButtonProps {
