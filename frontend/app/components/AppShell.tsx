@@ -76,11 +76,10 @@ const NAV_ITEMS: NavItem[] = [
     icon: <Zap size={17} />,
     label: "AI Інструменти",
     subItems: [
-      { href: "/dashboard/generate",        label: "Генерація документів" },
-      { href: "/dashboard/analyze",         label: "AI Аналізатор" },
-      { href: "/dashboard/strategy-studio", label: "Стратегія" },
-      { href: "/dashboard/full-lawyer",     label: "Повний юрист" },
-      { href: "/dashboard/auto-process",    label: "Автообробка", badge: "PRO+" },
+      { href: "/dashboard/analyze?mode=quick",       label: "AI Аналіз — Швидкий" },
+      { href: "/dashboard/analyze?mode=litigation",  label: "AI Аналіз — Судовий" },
+      { href: "/dashboard/generate?mode=single",     label: "Генерація — Документ" },
+      { href: "/dashboard/generate?mode=package",    label: "Генерація — Пакет", badge: "PRO+" },
     ],
   },
   {
@@ -89,11 +88,10 @@ const NAV_ITEMS: NavItem[] = [
     icon: <Search size={17} />,
     label: "Дослідження",
     subItems: [
-      { href: "/dashboard/case-law",          label: "Судова практика" },
-      { href: "/dashboard/registries",        label: "Реєстри",         badge: "NEW" },
-      { href: "/dashboard/monitoring",        label: "Моніторинг",      badge: "PRO+" },
-      { href: "/dashboard/knowledge-base",    label: "База знань",      badge: "NEW" },
-      { href: "/dashboard/decision-analysis", label: "Аналіз рішень" },
+      { href: "/dashboard/case-law",       label: "Судова практика" },
+      { href: "/dashboard/registries",     label: "Реєстри",     badge: "NEW" },
+      { href: "/dashboard/monitoring",     label: "Моніторинг",  badge: "PRO+" },
+      { href: "/dashboard/knowledge-base", label: "База знань",  badge: "NEW" },
     ],
   },
   {
@@ -160,7 +158,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // Auto-expand active group
   useEffect(() => {
     NAV_ITEMS.forEach((item) => {
-      if (item.type === "group" && item.subItems.some((s) => pathname.startsWith(s.href))) {
+      if (item.type === "group" && item.subItems.some((s) => pathname.startsWith(s.href.split("?")[0]))) {
         setExpandedMenus((prev) => ({ ...prev, [item.id]: true }));
       }
     });
@@ -266,7 +264,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             }
 
             const isOpen = expandedMenus[item.id];
-            const hasActive = item.subItems.some((s) => pathname.startsWith(s.href));
+            const hasActive = item.subItems.some((s) => pathname.startsWith(s.href.split("?")[0]));
             return (
               <div key={item.id} className="nav-accordion">
                 <div
@@ -292,7 +290,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                 {isOpen && (
                   <div className="nav-subitems">
                     {item.subItems.map((sub) => {
-                      const active = pathname.startsWith(sub.href);
+                      const active = pathname.startsWith(sub.href.split("?")[0]);
                       return (
                         <Link
                           key={sub.href}
