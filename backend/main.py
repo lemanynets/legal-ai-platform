@@ -98,12 +98,18 @@ async def rate_limit_middleware(request: Request, call_next):  # type: ignore[ty
             key = f"{ip}:{prefix}"
             allowed = await _rate_limiter.is_allowed(key, limit)
             if not allowed:
+                origin = request.headers.get("origin", "")
+                cors_origin = origin if origin in ALLOWED_ORIGINS else (ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else "*")
                 return JSONResponse(
                     status_code=429,
                     content={
                         "detail": f"Забагато запитів. Максимум {limit} запитів/хв для {prefix}. Спробуйте пізніше."
                     },
-                    headers={"Retry-After": "60"},
+                    headers={
+                        "Retry-After": "60",
+                        "Access-Control-Allow-Origin": cors_origin,
+                        "Access-Control-Allow-Credentials": "true",
+                    },
                 )
             break  # only apply first matching rule
     return await call_next(request)

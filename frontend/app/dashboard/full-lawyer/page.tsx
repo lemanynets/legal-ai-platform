@@ -1,16 +1,22 @@
 "use client";
 
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { Suspense, useEffect } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 
-export default function FullLawyerPage() {
+function Redirect() {
   const router = useRouter();
+  const sp = useSearchParams();
   useEffect(() => {
-    router.replace("/dashboard/analyze?mode=litigation");
-  }, [router]);
+    const extra = sp.toString();
+    router.replace(`/dashboard/analyze?mode=litigation${extra ? "&" + extra : ""}`);
+  }, [router, sp]);
   return (
     <div style={{ padding: "24px", color: "var(--text-secondary)" }}>
       Переходимо до AI Аналіз — Судовий...
     </div>
   );
+}
+
+export default function FullLawyerPage() {
+  return <Suspense><Redirect /></Suspense>;
 }

@@ -489,6 +489,12 @@ function GeneratePageInner() {
   const urlMode = searchParams.get("mode") || "single";
   const isPackageMode = urlMode === "package" || isBundleMode;
 
+  useEffect(() => {
+    if (urlMode === "package" && !isBundleMode) setIsBundleMode(true);
+    if (urlMode === "single" && isBundleMode) setIsBundleMode(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlMode]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
       <div className="section-header">
