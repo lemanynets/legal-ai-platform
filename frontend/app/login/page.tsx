@@ -2,7 +2,8 @@
 
 import React, { useState } from "react";
 import { useRouter } from "next/navigation";
-import { login, registerUser, devLogin, isDevAuthEnabled } from "@/lib/auth";
+import { login, registerUser, devLogin, isDevAuthEnabled, setSessionFromAccessToken } from "@/lib/auth";
+import { createKepChallenge, verifyKepAuth } from "@/lib/api";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -12,6 +13,40 @@ export default function LoginPage() {
   const [fullName, setFullName] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [kepLoading, setKepLoading] = useState(false);
+
+  async function handleKepLogin() {
+    setKepLoading(true);
+    setError("");
+    try {
+      const challenge = await createKepChallenge({ provider: "local_key", purpose: "login" });
+      const signedPayload = btoa(JSON.stringify({
+        challenge_id: challenge.challenge_id,
+        nonce: challenge.nonce,
+        issued_at: new Date().toISOString(),
+      }));
+      // NOTE: real integration should call a KEP SDK/provider here.
+      const placeholderSignature = btoa(`${challenge.nonce}:signed`);
+      const placeholderCertificate = btoa("demo-kep-certificate");
+      const auth = await verifyKepAuth({
+        challenge_id: challenge.challenge_id,
+        signature: placeholderSignature,
+        signed_payload: signedPayload,
+        certificate: placeholderCertificate,
+        provider: "local_key",
+      });
+      setSessionFromAccessToken({
+        access_token: auth.access_token,
+        email: auth.user?.email,
+        name: auth.user?.name,
+      });
+      router.replace("/dashboard");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Помилка КЕП авторизації");
+    } finally {
+      setKepLoading(false);
+    }
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -174,6 +209,17 @@ export default function LoginPage() {
                 <><span className="spinner" style={{ width: 16, height: 16 }} /> {isLogin ? "Вхід..." : "Реєстрація..."}</>
               ) : (isLogin ? "Увійти" : "Створити обліковий запис")}
             </button>
+            {isLogin && (
+              <button
+                type="button"
+                className="btn btn-secondary w-full"
+                style={{ height: "48px", fontSize: "15px" }}
+                disabled={kepLoading || loading}
+                onClick={() => void handleKepLogin()}
+              >
+                {kepLoading ? "Підписую КЕП..." : "Увійти через КЕП"}
+              </button>
+            )}
           </form>
 
           <hr className="divider" style={{ margin: "24px 0 20px" }} />

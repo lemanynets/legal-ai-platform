@@ -7,13 +7,14 @@ All routes are defined here so the build context is just backend/
 from __future__ import annotations
 
 import base64
+from collections import defaultdict, deque
 import hashlib
 import hmac
 import json
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import asyncio
@@ -21,7 +22,7 @@ import pathlib
 import time
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -322,6 +323,31 @@ _MIGRATIONS = [
         updated_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_ecourt_submissions_user_id ON ecourt_submissions(user_id)",
+    # ── KEP auth ──────────────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS auth_challenges (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        nonce TEXT NOT NULL,
+        purpose TEXT NOT NULL DEFAULT 'login',
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        ip TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_auth_challenges_used_at ON auth_challenges(used_at)",
+    """CREATE TABLE IF NOT EXISTS user_kep_identities (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        cert_fingerprint TEXT NOT NULL UNIQUE,
+        subject_dn TEXT NOT NULL DEFAULT '',
+        serial_number TEXT NOT NULL DEFAULT '',
+        issuer_dn TEXT NOT NULL DEFAULT '',
+        valid_from TIMESTAMPTZ,
+        valid_to TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_user_kep_identities_user_id ON user_kep_identities(user_id)",
     # ── Document Versions ────────────────────────────────────────────────────
     """CREATE TABLE IF NOT EXISTS document_versions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -338,6 +364,17 @@ _MIGRATIONS = [
 _SECRET = os.getenv("SECRET_KEY", "dev-secret-change-me")
 ALLOW_DEV_AUTH = os.getenv("ALLOW_DEV_AUTH", "false").lower() == "true"
 _bearer = HTTPBearer(auto_error=False)
+_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+
+
+def _check_rate_limit(key: str, limit: int, window_seconds: int) -> None:
+    now = time.time()
+    bucket = _RATE_LIMIT_BUCKETS[key]
+    while bucket and (now - bucket[0]) > window_seconds:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        raise HTTPException(status_code=429, detail="Забагато спроб. Спробуйте пізніше.")
+    bucket.append(now)
 
 
 def _make_token(user_id: str, email: str) -> str:
@@ -470,6 +507,80 @@ class AuthRequest(BaseModel):
     full_name: str | None = None
 
 
+class KepChallengeRequest(BaseModel):
+    provider: str = "local_key"
+    purpose: str = "login"
+
+
+class KepVerifyRequest(BaseModel):
+    challenge_id: str
+    signature: str
+    signed_payload: str
+    certificate: str
+    provider: str = "local_key"
+
+
+def _client_ip(raw: str | None) -> str:
+    if not raw:
+        return "unknown"
+    # X-Forwarded-For may contain a chain: "ip1, ip2"
+    return raw.split(",")[0].strip()
+
+
+def _make_nonce() -> str:
+    return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+
+
+def _decode_signed_payload(payload: str) -> dict:
+    try:
+        decoded = base64.b64decode(payload).decode("utf-8")
+        data = json.loads(decoded)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+async def _verify_kep_with_provider(body: KepVerifyRequest, nonce: str, challenge_id: str) -> tuple[bool, dict]:
+    payload = _decode_signed_payload(body.signed_payload)
+    if payload.get("nonce") != nonce or payload.get("challenge_id") != challenge_id:
+        return False, {"reason": "payload_nonce_mismatch"}
+    if not body.signature or not body.certificate:
+        return False, {"reason": "empty_signature_or_certificate"}
+
+    # Optional external verifier (recommended for production)
+    verifier_url = os.getenv("KEP_VERIFY_URL", "").strip()
+    verifier_token = os.getenv("KEP_VERIFY_TOKEN", "").strip()
+    if verifier_url:
+        try:
+            headers = {"Content-Type": "application/json"}
+            if verifier_token:
+                headers["Authorization"] = f"Bearer {verifier_token}"
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.post(
+                    verifier_url,
+                    headers=headers,
+                    json={
+                        "signature": body.signature,
+                        "signed_payload": body.signed_payload,
+                        "certificate": body.certificate,
+                        "provider": body.provider,
+                    },
+                )
+            if response.is_success:
+                data = response.json() if response.content else {}
+                return bool(data.get("valid", False)), data if isinstance(data, dict) else {}
+            return False, {"reason": f"provider_http_{response.status_code}"}
+        except Exception as e:
+            return False, {"reason": f"provider_error:{e}"}
+
+    # Local fallback/dev verification (not a cryptographic KEP validation).
+    if ALLOW_DEV_AUTH and body.signature and body.certificate:
+        return True, {"valid": True, "subject_dn": "CN=Dev KEP User", "serial_number": "dev-serial", "issuer_dn": "CN=Dev CA"}
+    return False, {"reason": "no_verifier_configured"}
+
+
 @app.post("/api/auth/login")
 async def login(body: AuthRequest, session: AsyncSession = Depends(get_session)):
     row = (
@@ -521,6 +632,182 @@ async def register(body: AuthRequest, session: AsyncSession = Depends(get_sessio
         "access_token": token, "token_type": "bearer",
         "user": {"id": uid, "email": body.email, "name": body.full_name},
     }
+
+
+@app.post("/api/auth/kep/challenge")
+async def create_kep_challenge(
+    body: KepChallengeRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
+    _check_rate_limit(f"kep:challenge:ip:{ip}", limit=10, window_seconds=60)
+    nonce = _make_nonce()
+    challenge_id = str(uuid.uuid4())
+    expires_at = datetime.utcnow() + timedelta(minutes=3)
+    ua = request.headers.get("user-agent", "")
+    await session.execute(
+        text("""
+            INSERT INTO auth_challenges (id, nonce, purpose, expires_at, ip, user_agent)
+            VALUES (:id, :nonce, :purpose, :expires_at, :ip, :ua)
+        """),
+        {"id": challenge_id, "nonce": nonce, "purpose": body.purpose or "login", "expires_at": expires_at, "ip": ip, "ua": ua},
+    )
+    await _audit_log(session, "system", "kep_challenge_created", "auth_challenge", challenge_id, {"provider": body.provider, "purpose": body.purpose, "ip": ip})
+    await session.commit()
+    return {
+        "challenge_id": challenge_id,
+        "nonce": nonce,
+        "expires_at": expires_at.isoformat() + "Z",
+        "algorithms": ["RSA-PSS-SHA256", "ECDSA-SHA256"],
+    }
+
+
+@app.post("/api/auth/kep/verify")
+async def verify_kep_auth(
+    body: KepVerifyRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
+    _check_rate_limit(f"kep:verify:ip:{ip}", limit=5, window_seconds=60)
+
+    cert_fingerprint = hashlib.sha256(body.certificate.encode()).hexdigest()
+    _check_rate_limit(f"kep:verify:fpr:{cert_fingerprint}", limit=5, window_seconds=600)
+
+    row = (
+        await session.execute(
+            text("""
+                SELECT id, nonce, purpose, expires_at, used_at
+                FROM auth_challenges
+                WHERE id = :id
+                LIMIT 1
+            """),
+            {"id": body.challenge_id},
+        )
+    ).mappings().first()
+    if not row:
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "challenge_not_found", "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_NOT_FOUND", "message": "Challenge не знайдено."})
+    if row.get("used_at"):
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_REPLAY_DETECTED", "message": "Challenge вже був використаний."})
+    if row.get("expires_at") and row["expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_EXPIRED", "message": "Challenge протермінований."})
+
+    ok, provider_data = await _verify_kep_with_provider(body, str(row["nonce"]), body.challenge_id)
+    if not ok:
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": provider_data.get("reason", "verify_failed"), "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_VERIFY_FAILED", "message": "Не вдалося перевірити КЕП підпис."})
+
+    subject_dn = str(provider_data.get("subject_dn") or "CN=KEP User")
+    serial_number = str(provider_data.get("serial_number") or cert_fingerprint[:16])
+    issuer_dn = str(provider_data.get("issuer_dn") or "CN=Unknown CA")
+    cert_email = f"kep-{cert_fingerprint[:12]}@local"
+
+    identity = (
+        await session.execute(
+            text("""
+                SELECT user_id FROM user_kep_identities
+                WHERE cert_fingerprint = :fp
+                LIMIT 1
+            """),
+            {"fp": cert_fingerprint},
+        )
+    ).mappings().first()
+
+    if identity:
+        user_row = (
+            await session.execute(
+                text("SELECT id, email, full_name FROM users WHERE id = :uid LIMIT 1"),
+                {"uid": identity["user_id"]},
+            )
+        ).mappings().first()
+    else:
+        user = await _get_or_create_user(session, cert_email, subject_dn.replace("CN=", "")[:120], password=None)
+        user_row = {"id": user["id"], "email": user.get("email", cert_email), "full_name": user.get("full_name")}
+        await session.execute(
+            text("""
+                INSERT INTO user_kep_identities
+                    (user_id, cert_fingerprint, subject_dn, serial_number, issuer_dn, valid_from, valid_to)
+                VALUES
+                    (:uid, :fp, :subject_dn, :serial_number, :issuer_dn, NOW(), NOW() + INTERVAL '365 days')
+                ON CONFLICT (cert_fingerprint) DO NOTHING
+            """),
+            {
+                "uid": str(user_row["id"]),
+                "fp": cert_fingerprint,
+                "subject_dn": subject_dn,
+                "serial_number": serial_number,
+                "issuer_dn": issuer_dn,
+            },
+        )
+
+    await session.execute(
+        text("UPDATE auth_challenges SET used_at = NOW() WHERE id = :id"),
+        {"id": body.challenge_id},
+    )
+    token = _make_token(str(user_row["id"]), str(user_row.get("email") or cert_email))
+    await _audit_log(session, str(user_row["id"]), "kep_verify_ok", "auth_challenge", body.challenge_id, {"provider": body.provider, "cert_fingerprint": cert_fingerprint, "ip": ip})
+    await session.commit()
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": str(user_row["id"]),
+            "email": str(user_row.get("email") or cert_email),
+            "name": str(user_row.get("full_name") or "KEP User"),
+        },
+    }
+
+
+@app.post("/api/auth/kep/link")
+async def link_kep_identity(
+    body: KepVerifyRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
+    row = (
+        await session.execute(
+            text("SELECT id, nonce, expires_at, used_at FROM auth_challenges WHERE id = :id LIMIT 1"),
+            {"id": body.challenge_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_NOT_FOUND", "message": "Challenge не знайдено."})
+    if row.get("used_at") or (row.get("expires_at") and row["expires_at"] < datetime.utcnow()):
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_INVALID", "message": "Challenge недійсний."})
+    ok, provider_data = await _verify_kep_with_provider(body, str(row["nonce"]), body.challenge_id)
+    if not ok:
+        await _audit_log(session, str(current_user["id"]), "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": provider_data.get("reason", "verify_failed"), "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_VERIFY_FAILED", "message": "Не вдалося перевірити КЕП підпис."})
+
+    cert_fingerprint = hashlib.sha256(body.certificate.encode()).hexdigest()
+    await session.execute(
+        text("""
+            INSERT INTO user_kep_identities
+                (user_id, cert_fingerprint, subject_dn, serial_number, issuer_dn, valid_from, valid_to)
+            VALUES
+                (:uid, :fp, :subject_dn, :serial_number, :issuer_dn, NOW(), NOW() + INTERVAL '365 days')
+            ON CONFLICT (cert_fingerprint)
+            DO UPDATE SET user_id = EXCLUDED.user_id
+        """),
+        {
+            "uid": str(current_user["id"]),
+            "fp": cert_fingerprint,
+            "subject_dn": str(provider_data.get("subject_dn") or "CN=KEP User"),
+            "serial_number": str(provider_data.get("serial_number") or cert_fingerprint[:16]),
+            "issuer_dn": str(provider_data.get("issuer_dn") or "CN=Unknown CA"),
+        },
+    )
+    await session.execute(text("UPDATE auth_challenges SET used_at = NOW() WHERE id = :id"), {"id": body.challenge_id})
+    await _audit_log(session, str(current_user["id"]), "kep_identity_linked", "auth_challenge", body.challenge_id, {"cert_fingerprint": cert_fingerprint, "ip": ip})
+    await session.commit()
+    return {"status": "linked", "cert_fingerprint": cert_fingerprint}
 
 
 @app.get("/api/auth/me")
