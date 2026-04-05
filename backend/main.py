@@ -402,6 +402,31 @@ _MIGRATIONS = [
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_document_versions_doc_id ON document_versions(document_id)",
+    # ── Intake cache (MD5 dedup) ─────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS intake_cache (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_md5 TEXT NOT NULL UNIQUE,
+    file_name TEXT,
+    result_json JSONB NOT NULL DEFAULT '{}',
+    hit_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_hit_at TIMESTAMPTZ DEFAULT NOW()
+)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_cache_md5 ON intake_cache(file_md5)",
+    # ── Analytics events ─────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS analytics_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    entity_type TEXT,
+    entity_id TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    session_id TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+)""",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_events_user_id ON analytics_events(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_events_event_type ON analytics_events(event_type)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_events_created_at ON analytics_events(created_at DESC)",
 ]
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────

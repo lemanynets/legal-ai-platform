@@ -223,6 +223,39 @@ async def _ai_json(prompt: str, max_tokens: int = 4096) -> dict | list:
         return {}
 
 
+# ── MD5 file hash helper ─────────────────────────────────────────────────────
+def _compute_md5(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+# ── Analytics event helper ────────────────────────────────────────────────────
+async def _analytics_event(
+    session: AsyncSession,
+    user_id: str,
+    event_type: str,
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Fire-and-forget analytics event. Never raises."""
+    try:
+        import uuid as _uuid
+        await session.execute(
+            text("""
+                INSERT INTO analytics_events (id, user_id, event_type, entity_type, entity_id, metadata)
+                VALUES (:id, :uid, :etype, :ent_type, :ent_id, :meta)
+            """),
+            {
+                "id": str(_uuid.uuid4()), "uid": user_id, "etype": event_type,
+                "ent_type": entity_type, "ent_id": entity_id,
+                "meta": json.dumps(metadata or {}),
+            },
+        )
+        await session.commit()
+    except Exception:
+        pass
+
+
 # ── OpenDataBot helper ────────────────────────────────────────────────────────
 _ODB_KEY = os.getenv("OPENDATABOT_API_KEY", "")
 _ODB_BASE = "https://api.opendatabot.ua"
