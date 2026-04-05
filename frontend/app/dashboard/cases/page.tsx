@@ -11,7 +11,7 @@ import {
   updateCase,
   type Case,
   type CaseDetail,
-} from "@/lib/api";
+} from "@/lib/services/cases.service";
 
 type TimelineItem =
   | {
