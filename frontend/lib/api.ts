@@ -1,3 +1,7 @@
+/**
+ * @deprecated New code should be added to `frontend/lib/services/*`
+ * (strangler migration). Keep this file for backward compatibility only.
+ */
 export type DocumentType = {
   doc_type: string;
   title: string;
@@ -2727,6 +2731,92 @@ export async function generateDocument(
   });
 }
 
+export type AsyncJobEnqueueResponse = {
+  status: "queued";
+  job_id: string;
+  task_id: string;
+};
+
+export type AsyncJobStatusResponse = {
+  job_id: string;
+  task_id: string;
+  status: "queued" | "running" | "success" | "failed";
+  progress: number;
+  message?: string | null;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
+};
+
+export async function enqueueGenerateJob(
+  docType: string,
+  formData: Record<string, unknown>,
+  tariff: string,
+  token?: string,
+  demoUser?: string,
+  options?: Parameters<typeof generateDocument>[5]
+): Promise<AsyncJobEnqueueResponse> {
+  return request<AsyncJobEnqueueResponse>("/api/jobs/generate", {
+    method: "POST",
+    body: {
+      doc_type: docType,
+      form_data: formData,
+      tariff,
+      extra_prompt_context: options?.extra_prompt_context,
+    },
+    token,
+    demoUser,
+  });
+}
+
+export async function enqueueAnalyzeIntakeJob(
+  payload: { file: File; jurisdiction?: string; mode?: "standard" | "deep" },
+  token?: string,
+  demoUser?: string
+): Promise<AsyncJobEnqueueResponse> {
+  const form = new FormData();
+  form.append("file", payload.file);
+  if (payload.jurisdiction) form.append("jurisdiction", payload.jurisdiction);
+  if (payload.mode) form.append("mode", payload.mode);
+
+  const response = await safeFetch(`${API_BASE}/api/jobs/analyze-intake`, {
+    method: "POST",
+    headers: buildAuthHeaders(token, demoUser),
+    body: form,
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw await buildApiError(response);
+  }
+  return (await response.json()) as AsyncJobEnqueueResponse;
+}
+
+export async function getAsyncJobStatus(
+  jobId: string,
+  token?: string,
+  demoUser?: string
+): Promise<AsyncJobStatusResponse> {
+  return request<AsyncJobStatusResponse>(`/api/jobs/${jobId}`, { token, demoUser });
+}
+
+export async function waitForAsyncJobResult(
+  jobId: string,
+  onTick: (status: AsyncJobStatusResponse) => void,
+  token?: string,
+  demoUser?: string,
+  timeoutMs: number = 120_000
+): Promise<AsyncJobStatusResponse> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const status = await getAsyncJobStatus(jobId, token, demoUser);
+    onTick(status);
+    if (status.status === "success" || status.status === "failed") {
+      return status;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+  }
+  throw new Error("Асинхронна задача не завершилась у відведений час.");
+}
+
 export async function getBillingPlans(): Promise<BillingPlan[]> {
   // Public pricing data — honour server Cache-Control headers.
   const data = await request<{ items: BillingPlan[] }>("/api/billing/plans", {
@@ -3652,6 +3742,82 @@ export async function getUserInfo(
   demoUser?: string
 ): Promise<{ user_id: string; email: string; workspace_id: string; role: string; full_name?: string; company?: string; logo_url?: string; entity_type?: string; tax_id?: string; address?: string; phone?: string; }> {
   return request("/api/auth/me", { token, demoUser });
+}
+
+export type KepChallengeResponse = {
+  challenge_id: string;
+  nonce: string;
+  expires_at: string;
+  algorithms: string[];
+  challenge_payload: {
+    challenge_id: string;
+    nonce: string;
+    purpose: "login" | "link";
+    origin: string;
+    ua_hash: string;
+    issued_at: string;
+  };
+};
+
+export type KepVerifyResponse = {
+  access_token: string;
+  token_type: "bearer";
+  user: {
+    id: string;
+    email: string;
+    name: string;
+  };
+};
+
+export async function createKepChallenge(
+  payload: { provider: string; purpose?: "login" | "link" },
+  token?: string,
+  demoUser?: string
+): Promise<KepChallengeResponse> {
+  return request<KepChallengeResponse>("/api/auth/kep/challenge", {
+    method: "POST",
+    body: payload,
+    token,
+    demoUser
+  });
+}
+
+export async function verifyKepAuth(
+  payload: {
+    challenge_id: string;
+    signature: string;
+    signed_payload: string;
+    certificate: string;
+    provider: string;
+  },
+  token?: string,
+  demoUser?: string
+): Promise<KepVerifyResponse> {
+  return request<KepVerifyResponse>("/api/auth/kep/verify", {
+    method: "POST",
+    body: payload,
+    token,
+    demoUser
+  });
+}
+
+export async function linkKepIdentity(
+  payload: {
+    challenge_id: string;
+    signature: string;
+    signed_payload: string;
+    certificate: string;
+    provider?: string;
+  },
+  token?: string,
+  demoUser?: string
+): Promise<{ status: string; cert_fingerprint: string }> {
+  return request<{ status: string; cert_fingerprint: string }>("/api/auth/kep/link", {
+    method: "POST",
+    body: payload,
+    token,
+    demoUser
+  });
 }
 
 export async function updateUserInfo(

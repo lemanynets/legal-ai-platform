@@ -7,13 +7,14 @@ All routes are defined here so the build context is just backend/
 from __future__ import annotations
 
 import base64
+from collections import defaultdict, deque
 import hashlib
 import hmac
 import json
 import os
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import asyncio
@@ -21,7 +22,7 @@ import pathlib
 import time
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -29,7 +30,10 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.router import api_v1_router
+from app.core.celery_app import celery_app
 from app.db import Base, engine, get_session
+from app.tasks.ai_jobs import analyze_intake_job, generate_document_job
 
 # ── Upload directory (ephemeral but safe for single request lifecycle) ─────────
 UPLOAD_DIR = pathlib.Path(os.getenv("UPLOAD_DIR", "/tmp/uploads"))
@@ -37,6 +41,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Legal AI Platform", version="1.0.0")
+app.include_router(api_v1_router, prefix="/api/v1")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://frontend-production-459a.up.railway.app")
 ALLOWED_ORIGINS = [
@@ -62,12 +67,14 @@ async def startup():
             from app.models.user import User  # noqa: F401
             from app.models.case import Case  # noqa: F401
             await conn.run_sync(Base.metadata.create_all)
-            # Ensure extra columns exist (idempotent migrations)
-            for stmt in _MIGRATIONS:
-                try:
-                    await conn.execute(text(stmt))
-                except Exception:
-                    pass
+            # Temporary backward-compat fallback for older environments.
+            # New schema changes MUST go through Alembic revisions.
+            if os.getenv("STARTUP_DDL_FALLBACK", "true").lower() == "true":
+                for stmt in _MIGRATIONS:
+                    try:
+                        await conn.execute(text(stmt))
+                    except Exception:
+                        pass
     except Exception as e:
         print(f"[startup] DB init skipped: {e}")
 
@@ -196,6 +203,18 @@ _MIGRATIONS = [
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_deadlines_user_id ON deadlines(user_id)",
+    """CREATE TABLE IF NOT EXISTS deadline_notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        deadline_id UUID NOT NULL REFERENCES deadlines(id) ON DELETE CASCADE,
+        channel TEXT NOT NULL DEFAULT 'in_app',
+        message TEXT NOT NULL,
+        scheduled_for TIMESTAMPTZ,
+        sent_at TIMESTAMPTZ,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_deadline_notifications_user_id ON deadline_notifications(user_id)",
     # ── Case Law ─────────────────────────────────────────────────────────────
     """CREATE TABLE IF NOT EXISTS case_law_items (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -286,6 +305,61 @@ _MIGRATIONS = [
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_registry_events_user_id ON registry_events(user_id)",
+    """CREATE TABLE IF NOT EXISTS registry_snapshots (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        watch_item_id UUID NOT NULL REFERENCES registry_watch_items(id) ON DELETE CASCADE,
+        snapshot JSONB NOT NULL DEFAULT '{}',
+        source TEXT NOT NULL DEFAULT 'opendatabot',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_registry_snapshots_user_id ON registry_snapshots(user_id)",
+    """CREATE TABLE IF NOT EXISTS legal_sources (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code TEXT NOT NULL,
+        title TEXT NOT NULL,
+        article TEXT,
+        source_url TEXT,
+        metadata JSONB NOT NULL DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_legal_sources_user_id ON legal_sources(user_id)",
+    """CREATE TABLE IF NOT EXISTS legal_source_chunks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        source_id UUID NOT NULL REFERENCES legal_sources(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        chunk_index INT NOT NULL DEFAULT 0,
+        content TEXT NOT NULL,
+        embedding JSONB NOT NULL DEFAULT '[]',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_legal_source_chunks_source_id ON legal_source_chunks(source_id)",
+    """CREATE TABLE IF NOT EXISTS async_jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL UNIQUE,
+        job_type TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        payload JSONB NOT NULL DEFAULT '{}',
+        result JSONB,
+        error_message TEXT,
+        retries INT NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_async_jobs_user_id ON async_jobs(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_async_jobs_status ON async_jobs(status)",
+    """CREATE TABLE IF NOT EXISTS dead_letter_jobs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        job_type TEXT NOT NULL,
+        error_message TEXT,
+        meta JSONB NOT NULL DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_dead_letter_jobs_user_id ON dead_letter_jobs(user_id)",
     # ── Forum ─────────────────────────────────────────────────────────────────
     """CREATE TABLE IF NOT EXISTS forum_posts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -322,6 +396,37 @@ _MIGRATIONS = [
         updated_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_ecourt_submissions_user_id ON ecourt_submissions(user_id)",
+    # ── KEP auth ──────────────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS auth_challenges (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        nonce TEXT NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'local_key',
+        purpose TEXT NOT NULL DEFAULT 'login',
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ,
+        ip TEXT,
+        user_agent TEXT,
+        origin TEXT,
+        ua_hash TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_auth_challenges_expires_at ON auth_challenges(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_auth_challenges_used_at ON auth_challenges(used_at)",
+    "ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'local_key'",
+    "ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS origin TEXT",
+    "ALTER TABLE auth_challenges ADD COLUMN IF NOT EXISTS ua_hash TEXT",
+    """CREATE TABLE IF NOT EXISTS user_kep_identities (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        cert_fingerprint TEXT NOT NULL UNIQUE,
+        subject_dn TEXT NOT NULL DEFAULT '',
+        serial_number TEXT NOT NULL DEFAULT '',
+        issuer_dn TEXT NOT NULL DEFAULT '',
+        valid_from TIMESTAMPTZ,
+        valid_to TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_user_kep_identities_user_id ON user_kep_identities(user_id)",
     # ── Document Versions ────────────────────────────────────────────────────
     """CREATE TABLE IF NOT EXISTS document_versions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -338,6 +443,21 @@ _MIGRATIONS = [
 _SECRET = os.getenv("SECRET_KEY", "dev-secret-change-me")
 ALLOW_DEV_AUTH = os.getenv("ALLOW_DEV_AUTH", "false").lower() == "true"
 _bearer = HTTPBearer(auto_error=False)
+_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+KEP_ALLOWED_PURPOSES = {"login", "link"}
+KEP_ALLOWED_PROVIDERS = {"local_key", "cloud_sign"}
+KEP_CHALLENGE_TTL_SECONDS = 180
+KEP_ISSUED_AT_MAX_SKEW_SECONDS = 300
+
+
+def _check_rate_limit(key: str, limit: int, window_seconds: int) -> None:
+    now = time.time()
+    bucket = _RATE_LIMIT_BUCKETS[key]
+    while bucket and (now - bucket[0]) > window_seconds:
+        bucket.popleft()
+    if len(bucket) >= limit:
+        raise HTTPException(status_code=429, detail="Забагато спроб. Спробуйте пізніше.")
+    bucket.append(now)
 
 
 def _make_token(user_id: str, email: str) -> str:
@@ -470,6 +590,125 @@ class AuthRequest(BaseModel):
     full_name: str | None = None
 
 
+class KepChallengeRequest(BaseModel):
+    provider: str = "local_key"
+    purpose: str = "login"
+
+
+class KepVerifyRequest(BaseModel):
+    challenge_id: str
+    signature: str
+    signed_payload: str
+    certificate: str
+    provider: str = "local_key"
+
+
+def _client_ip(raw: str | None) -> str:
+    if not raw:
+        return "unknown"
+    # X-Forwarded-For may contain a chain: "ip1, ip2"
+    return raw.split(",")[0].strip()
+
+
+def _make_nonce() -> str:
+    return base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+
+
+def _safe_b64_decode(value: str) -> bytes:
+    padded = value + ("=" * (-len(value) % 4))
+    try:
+        return base64.urlsafe_b64decode(padded.encode())
+    except Exception:
+        return base64.b64decode(padded.encode())
+
+
+def _ua_hash(user_agent: str) -> str:
+    return hashlib.sha256((user_agent or "").encode("utf-8")).hexdigest()
+
+
+def _origin_from_request(request: Request) -> str:
+    origin = request.headers.get("origin", "").strip()
+    if origin:
+        return origin
+    host = request.headers.get("host", "").strip()
+    if host:
+        proto = request.headers.get("x-forwarded-proto", "https").strip() or "https"
+        return f"{proto}://{host}"
+    return "unknown"
+
+
+def _decode_signed_payload(payload: str) -> dict:
+    try:
+        decoded = _safe_b64_decode(payload).decode("utf-8")
+        data = json.loads(decoded)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+async def _verify_kep_with_provider(
+    body: KepVerifyRequest,
+    nonce: str,
+    challenge_id: str,
+    expected_origin: str,
+    expected_ua_hash: str,
+    expected_purpose: str,
+) -> tuple[bool, dict]:
+    payload = _decode_signed_payload(body.signed_payload)
+    if payload.get("nonce") != nonce or payload.get("challenge_id") != challenge_id:
+        return False, {"reason": "payload_nonce_mismatch"}
+    if payload.get("origin") != expected_origin:
+        return False, {"reason": "payload_origin_mismatch"}
+    if payload.get("ua_hash") != expected_ua_hash:
+        return False, {"reason": "payload_ua_mismatch"}
+    if payload.get("purpose") != expected_purpose:
+        return False, {"reason": "payload_purpose_mismatch"}
+    issued_at_raw = str(payload.get("issued_at") or "").strip()
+    try:
+        issued_at = datetime.fromisoformat(issued_at_raw.replace("Z", "+00:00"))
+        if issued_at.tzinfo is not None:
+            issued_at = issued_at.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        return False, {"reason": "payload_issued_at_invalid"}
+    if abs((datetime.utcnow() - issued_at).total_seconds()) > KEP_ISSUED_AT_MAX_SKEW_SECONDS:
+        return False, {"reason": "payload_issued_at_skew"}
+    if not body.signature or not body.certificate:
+        return False, {"reason": "empty_signature_or_certificate"}
+
+    # Optional external verifier (recommended for production)
+    verifier_url = os.getenv("KEP_VERIFY_URL", "").strip()
+    verifier_token = os.getenv("KEP_VERIFY_TOKEN", "").strip()
+    if verifier_url:
+        try:
+            headers = {"Content-Type": "application/json"}
+            if verifier_token:
+                headers["Authorization"] = f"Bearer {verifier_token}"
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.post(
+                    verifier_url,
+                    headers=headers,
+                    json={
+                        "signature": body.signature,
+                        "signed_payload": body.signed_payload,
+                        "certificate": body.certificate,
+                        "provider": body.provider,
+                    },
+                )
+            if response.is_success:
+                data = response.json() if response.content else {}
+                return bool(data.get("valid", False)), data if isinstance(data, dict) else {}
+            return False, {"reason": f"provider_http_{response.status_code}"}
+        except Exception as e:
+            return False, {"reason": f"provider_error:{e}"}
+
+    # Local fallback/dev verification (not a cryptographic KEP validation).
+    if ALLOW_DEV_AUTH and body.signature and body.certificate:
+        return True, {"valid": True, "subject_dn": "CN=Dev KEP User", "serial_number": "dev-serial", "issuer_dn": "CN=Dev CA"}
+    return False, {"reason": "no_verifier_configured"}
+
+
 @app.post("/api/auth/login")
 async def login(body: AuthRequest, session: AsyncSession = Depends(get_session)):
     row = (
@@ -521,6 +760,240 @@ async def register(body: AuthRequest, session: AsyncSession = Depends(get_sessio
         "access_token": token, "token_type": "bearer",
         "user": {"id": uid, "email": body.email, "name": body.full_name},
     }
+
+
+@app.post("/api/auth/kep/challenge")
+async def create_kep_challenge(
+    body: KepChallengeRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    if body.purpose not in KEP_ALLOWED_PURPOSES:
+        raise HTTPException(status_code=400, detail={"error_code": "KEP_PURPOSE_INVALID", "message": "Непідтримуваний purpose."})
+    if body.provider not in KEP_ALLOWED_PROVIDERS:
+        raise HTTPException(status_code=400, detail={"error_code": "KEP_PROVIDER_INVALID", "message": "Непідтримуваний провайдер КЕП."})
+    ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
+    _check_rate_limit(f"kep:challenge:ip:{ip}", limit=10, window_seconds=60)
+    nonce = _make_nonce()
+    challenge_id = str(uuid.uuid4())
+    expires_at = datetime.utcnow() + timedelta(seconds=KEP_CHALLENGE_TTL_SECONDS)
+    ua = request.headers.get("user-agent", "")
+    origin = _origin_from_request(request)
+    ua_digest = _ua_hash(ua)
+    issued_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    challenge_payload = {
+        "challenge_id": challenge_id,
+        "nonce": nonce,
+        "purpose": body.purpose,
+        "origin": origin,
+        "ua_hash": ua_digest,
+        "issued_at": issued_at,
+    }
+    await session.execute(
+        text("""
+            INSERT INTO auth_challenges (id, nonce, provider, purpose, expires_at, ip, user_agent, origin, ua_hash)
+            VALUES (:id, :nonce, :provider, :purpose, :expires_at, :ip, :ua, :origin, :ua_hash)
+        """),
+        {
+            "id": challenge_id,
+            "nonce": nonce,
+            "provider": body.provider,
+            "purpose": body.purpose,
+            "expires_at": expires_at,
+            "ip": ip,
+            "ua": ua,
+            "origin": origin,
+            "ua_hash": ua_digest,
+        },
+    )
+    await _audit_log(session, "system", "kep_challenge_created", "auth_challenge", challenge_id, {"provider": body.provider, "purpose": body.purpose, "ip": ip})
+    await session.commit()
+    return {
+        "challenge_id": challenge_id,
+        "nonce": nonce,
+        "expires_at": expires_at.isoformat() + "Z",
+        "algorithms": ["RSA-PSS-SHA256", "ECDSA-SHA256"],
+        "challenge_payload": challenge_payload,
+    }
+
+
+@app.post("/api/auth/kep/verify")
+async def verify_kep_auth(
+    body: KepVerifyRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
+    _check_rate_limit(f"kep:verify:ip:{ip}", limit=5, window_seconds=60)
+
+    cert_fingerprint = hashlib.sha256(body.certificate.encode()).hexdigest()
+    _check_rate_limit(f"kep:verify:fpr:{cert_fingerprint}", limit=5, window_seconds=600)
+
+    row = (
+        await session.execute(
+            text("""
+                SELECT id, nonce, provider, purpose, expires_at, used_at, origin, ua_hash
+                FROM auth_challenges
+                WHERE id = :id
+                LIMIT 1
+            """),
+            {"id": body.challenge_id},
+        )
+    ).mappings().first()
+    if not row:
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "challenge_not_found", "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_NOT_FOUND", "message": "Challenge не знайдено."})
+    if row.get("used_at"):
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "challenge_replay", "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_REPLAY_DETECTED", "message": "Challenge вже був використаний."})
+    if row.get("expires_at") and row["expires_at"] < datetime.utcnow():
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "challenge_expired", "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_EXPIRED", "message": "Challenge протермінований."})
+    if str(row.get("provider") or "local_key") != body.provider:
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "provider_mismatch", "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_PROVIDER_MISMATCH", "message": "Challenge створено для іншого КЕП-провайдера."})
+    if str(row.get("purpose") or "login") != "login":
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": "purpose_mismatch", "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_PURPOSE_MISMATCH", "message": "Невірний тип challenge для входу."})
+
+    ok, provider_data = await _verify_kep_with_provider(
+        body,
+        str(row["nonce"]),
+        body.challenge_id,
+        str(row.get("origin") or _origin_from_request(request)),
+        str(row.get("ua_hash") or _ua_hash(request.headers.get("user-agent", ""))),
+        "login",
+    )
+    if not ok:
+        await _audit_log(session, "system", "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": provider_data.get("reason", "verify_failed"), "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_VERIFY_FAILED", "message": "Не вдалося перевірити КЕП підпис."})
+
+    subject_dn = str(provider_data.get("subject_dn") or "CN=KEP User")
+    serial_number = str(provider_data.get("serial_number") or cert_fingerprint[:16])
+    issuer_dn = str(provider_data.get("issuer_dn") or "CN=Unknown CA")
+    cert_email = f"kep-{cert_fingerprint[:12]}@local"
+
+    identity = (
+        await session.execute(
+            text("""
+                SELECT user_id FROM user_kep_identities
+                WHERE cert_fingerprint = :fp
+                LIMIT 1
+            """),
+            {"fp": cert_fingerprint},
+        )
+    ).mappings().first()
+
+    if identity:
+        user_row = (
+            await session.execute(
+                text("SELECT id, email, full_name FROM users WHERE id = :uid LIMIT 1"),
+                {"uid": identity["user_id"]},
+            )
+        ).mappings().first()
+    else:
+        user = await _get_or_create_user(session, cert_email, subject_dn.replace("CN=", "")[:120], password=None)
+        user_row = {"id": user["id"], "email": user.get("email", cert_email), "full_name": user.get("full_name")}
+        await session.execute(
+            text("""
+                INSERT INTO user_kep_identities
+                    (user_id, cert_fingerprint, subject_dn, serial_number, issuer_dn, valid_from, valid_to)
+                VALUES
+                    (:uid, :fp, :subject_dn, :serial_number, :issuer_dn, NOW(), NOW() + INTERVAL '365 days')
+                ON CONFLICT (cert_fingerprint) DO NOTHING
+            """),
+            {
+                "uid": str(user_row["id"]),
+                "fp": cert_fingerprint,
+                "subject_dn": subject_dn,
+                "serial_number": serial_number,
+                "issuer_dn": issuer_dn,
+            },
+        )
+
+    await session.execute(
+        text("UPDATE auth_challenges SET used_at = NOW() WHERE id = :id"),
+        {"id": body.challenge_id},
+    )
+    token = _make_token(str(user_row["id"]), str(user_row.get("email") or cert_email))
+    await _audit_log(session, str(user_row["id"]), "kep_verify_ok", "auth_challenge", body.challenge_id, {"provider": body.provider, "cert_fingerprint": cert_fingerprint, "ip": ip})
+    await session.commit()
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": str(user_row["id"]),
+            "email": str(user_row.get("email") or cert_email),
+            "name": str(user_row.get("full_name") or "KEP User"),
+        },
+    }
+
+
+@app.post("/api/auth/kep/link")
+async def link_kep_identity(
+    body: KepVerifyRequest,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    ip = _client_ip(request.headers.get("x-forwarded-for") or request.client.host if request.client else "")
+    _check_rate_limit(f"kep:link:ip:{ip}", limit=5, window_seconds=60)
+    cert_fingerprint = hashlib.sha256(body.certificate.encode()).hexdigest()
+    _check_rate_limit(f"kep:link:fpr:{cert_fingerprint}", limit=5, window_seconds=600)
+    row = (
+        await session.execute(
+            text("SELECT id, nonce, provider, purpose, expires_at, used_at, origin, ua_hash FROM auth_challenges WHERE id = :id LIMIT 1"),
+            {"id": body.challenge_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_NOT_FOUND", "message": "Challenge не знайдено."})
+    if row.get("used_at") or (row.get("expires_at") and row["expires_at"] < datetime.utcnow()):
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_CHALLENGE_INVALID", "message": "Challenge недійсний."})
+    if str(row.get("provider") or "local_key") != body.provider:
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_PROVIDER_MISMATCH", "message": "Challenge створено для іншого КЕП-провайдера."})
+    if str(row.get("purpose") or "login") != "link":
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_PURPOSE_MISMATCH", "message": "Невірний тип challenge для прив'язки."})
+    ok, provider_data = await _verify_kep_with_provider(
+        body,
+        str(row["nonce"]),
+        body.challenge_id,
+        str(row.get("origin") or _origin_from_request(request)),
+        str(row.get("ua_hash") or _ua_hash(request.headers.get("user-agent", ""))),
+        "link",
+    )
+    if not ok:
+        await _audit_log(session, str(current_user["id"]), "kep_verify_failed", "auth_challenge", body.challenge_id, {"error": provider_data.get("reason", "verify_failed"), "ip": ip})
+        await session.commit()
+        raise HTTPException(status_code=401, detail={"error_code": "KEP_VERIFY_FAILED", "message": "Не вдалося перевірити КЕП підпис."})
+
+    await session.execute(
+        text("""
+            INSERT INTO user_kep_identities
+                (user_id, cert_fingerprint, subject_dn, serial_number, issuer_dn, valid_from, valid_to)
+            VALUES
+                (:uid, :fp, :subject_dn, :serial_number, :issuer_dn, NOW(), NOW() + INTERVAL '365 days')
+            ON CONFLICT (cert_fingerprint)
+            DO UPDATE SET user_id = EXCLUDED.user_id
+        """),
+        {
+            "uid": str(current_user["id"]),
+            "fp": cert_fingerprint,
+            "subject_dn": str(provider_data.get("subject_dn") or "CN=KEP User"),
+            "serial_number": str(provider_data.get("serial_number") or cert_fingerprint[:16]),
+            "issuer_dn": str(provider_data.get("issuer_dn") or "CN=Unknown CA"),
+        },
+    )
+    await session.execute(text("UPDATE auth_challenges SET used_at = NOW() WHERE id = :id"), {"id": body.challenge_id})
+    await _audit_log(session, str(current_user["id"]), "kep_identity_linked", "auth_challenge", body.challenge_id, {"cert_fingerprint": cert_fingerprint, "ip": ip})
+    await session.commit()
+    return {"status": "linked", "cert_fingerprint": cert_fingerprint}
 
 
 @app.get("/api/auth/me")
@@ -636,6 +1109,202 @@ async def subscribe_plan(
     return {"status": "ok", "plan": plan}
 
 
+class LegalSourceIndexRequest(BaseModel):
+    code: str
+    title: str
+    article: str | None = None
+    text: str
+    source_url: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class LegalRetrieveRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+def _text_to_embedding(text_value: str, dim: int = 64) -> list[float]:
+    # Deterministic lightweight embedding fallback (works without extra deps).
+    buckets = [0.0] * dim
+    for token in re.findall(r"[\\w\\-]+", (text_value or "").lower()):
+        idx = abs(hash(token)) % dim
+        buckets[idx] += 1.0
+    norm = sum(v * v for v in buckets) ** 0.5
+    if norm > 0:
+        buckets = [v / norm for v in buckets]
+    return buckets
+
+
+def _vector_backend_info() -> dict[str, Any]:
+    backend = os.getenv("LEGAL_VECTOR_BACKEND", "pgvector").lower()
+    if backend not in {"pgvector", "chroma"}:
+        backend = "pgvector"
+    return {
+        "backend": backend,
+        "ready": True,
+        "note": "Storage is persisted in Postgres tables; adapter target can be pgvector/chroma via LEGAL_VECTOR_BACKEND.",
+    }
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b:
+        return 0.0
+    size = min(len(a), len(b))
+    dot = sum(a[i] * b[i] for i in range(size))
+    return float(dot)
+
+
+def _chunk_text(raw: str, chunk_size: int = 700, overlap: int = 120) -> list[str]:
+    text_value = (raw or "").strip()
+    if not text_value:
+        return []
+    chunks: list[str] = []
+    step = max(1, chunk_size - overlap)
+    for start in range(0, len(text_value), step):
+        chunk = text_value[start:start + chunk_size].strip()
+        if chunk:
+            chunks.append(chunk)
+        if start + chunk_size >= len(text_value):
+            break
+    return chunks
+
+
+async def _retrieve_legal_chunks(session: AsyncSession, uid: str, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    query_vec = _text_to_embedding(query)
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT c.id, c.content, c.embedding, c.chunk_index,
+                       s.code, s.title, s.article, s.source_url
+                FROM legal_source_chunks c
+                JOIN legal_sources s ON s.id = c.source_id
+                WHERE c.user_id = :uid
+                LIMIT 2000
+                """
+            ),
+            {"uid": uid},
+        )
+    ).mappings().all()
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for r in rows:
+        embedding = r.get("embedding") or []
+        if isinstance(embedding, str):
+            try:
+                embedding = json.loads(embedding)
+            except Exception:
+                embedding = []
+        score = _cosine(query_vec, embedding if isinstance(embedding, list) else [])
+        payload = dict(r)
+        payload["score"] = round(score, 6)
+        ranked.append((score, payload))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [item for _, item in ranked[: max(1, min(top_k, 20))]]
+
+
+def _build_citations(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    citations: list[dict[str, Any]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        locator = chunk.get("article") or f"chunk#{chunk.get('chunk_index', 0)}"
+        citations.append(
+            {
+                "citation_id": f"CIT-{idx}",
+                "code": chunk.get("code"),
+                "title": chunk.get("title"),
+                "locator": locator,
+                "source_url": chunk.get("source_url"),
+                "evidence_span": (chunk.get("content") or "")[:240],
+                "score": chunk.get("score", 0.0),
+            }
+        )
+    return citations
+
+
+def _grounding_quality_metrics(generated_text: str, citations: list[dict[str, Any]]) -> dict[str, Any]:
+    text_u = (generated_text or "").upper()
+    if not citations:
+        return {"citation_coverage": 0.0, "faithfulness": 0.0, "citations_count": 0}
+    mentioned = 0
+    faithful = 0
+    for c in citations:
+        locator = str(c.get("locator") or "").upper()
+        title = str(c.get("title") or "").upper()
+        evidence = str(c.get("evidence_span") or "")[:80].upper()
+        if locator and locator in text_u or (title and title in text_u):
+            mentioned += 1
+        if evidence and evidence[:30] in text_u:
+            faithful += 1
+    total = len(citations)
+    return {
+        "citation_coverage": round(mentioned / total, 4),
+        "faithfulness": round(faithful / total, 4),
+        "citations_count": total,
+    }
+
+
+@app.post("/api/legal-brain/sources/index")
+async def index_legal_source(
+    body: LegalSourceIndexRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    source_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            """
+            INSERT INTO legal_sources (id, user_id, code, title, article, source_url, metadata)
+            VALUES (:id, :uid, :code, :title, :article, :source_url, :metadata::jsonb)
+            """
+        ),
+        {
+            "id": source_id,
+            "uid": uid,
+            "code": body.code,
+            "title": body.title,
+            "article": body.article,
+            "source_url": body.source_url,
+            "metadata": json.dumps(body.metadata or {}, ensure_ascii=False),
+        },
+    )
+    chunks = _chunk_text(body.text)
+    for idx, chunk in enumerate(chunks):
+        await session.execute(
+            text(
+                """
+                INSERT INTO legal_source_chunks (id, source_id, user_id, chunk_index, content, embedding)
+                VALUES (:id, :source_id, :uid, :chunk_index, :content, :embedding::jsonb)
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "source_id": source_id,
+                "uid": uid,
+                "chunk_index": idx,
+                "content": chunk,
+                "embedding": json.dumps(_text_to_embedding(chunk), ensure_ascii=False),
+            },
+        )
+    await session.commit()
+    return {"status": "indexed", "source_id": source_id, "chunks": len(chunks)}
+
+
+@app.post("/api/legal-brain/retrieve")
+async def retrieve_legal_context(
+    body: LegalRetrieveRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    chunks = await _retrieve_legal_chunks(session, uid, body.query, body.top_k)
+    return {"query": body.query, "items": _build_citations(chunks), "vector_backend": _vector_backend_info()}
+
+
+@app.get("/api/legal-brain/vector-backend")
+async def get_vector_backend_status():
+    return _vector_backend_info()
+
+
 # ============================================================================
 # DOCUMENTS
 # ============================================================================
@@ -655,6 +1324,101 @@ _DOC_LABELS: dict[str, str] = {
     "dohovir_nadannia_posluh": "Договір про надання послуг",
     "pretenziya": "Претензія",
     "dovirennist": "Довіреність",
+}
+
+_FORM_SCHEMA_CATALOG: dict[str, dict[str, Any]] = {
+    "pozov_do_sudu": {
+        "title": "Схема для позову до суду",
+        "fields": [
+            {"name": "court_name", "label": "Суд", "type": "text", "required": True},
+            {"name": "claimant_name", "label": "Позивач", "type": "text", "required": True},
+            {"name": "respondent_name", "label": "Відповідач", "type": "text", "required": True},
+            {"name": "claim_subject", "label": "Суть позову", "type": "textarea", "required": True},
+            {"name": "claim_amount", "label": "Ціна позову", "type": "number", "required": False},
+            {"name": "facts", "label": "Обставини", "type": "textarea", "required": True},
+            {"name": "legal_basis", "label": "Правова підстава", "type": "textarea", "required": True},
+            {"name": "requests", "label": "Прохальна частина", "type": "textarea", "required": True},
+        ],
+    },
+    "pozov_trudovyi": {
+        "title": "Схема для трудового позову",
+        "fields": [
+            {"name": "court_name", "label": "Суд", "type": "text", "required": True},
+            {"name": "employee_name", "label": "Працівник", "type": "text", "required": True},
+            {"name": "employer_name", "label": "Роботодавець", "type": "text", "required": True},
+            {"name": "employment_period", "label": "Період роботи", "type": "text", "required": True},
+            {"name": "violation_description", "label": "Порушення", "type": "textarea", "required": True},
+            {"name": "claim_amount", "label": "Сума вимог", "type": "number", "required": False},
+            {"name": "requests", "label": "Прохальна частина", "type": "textarea", "required": True},
+        ],
+    },
+    "appeal_complaint": {
+        "title": "Схема для апеляційної скарги",
+        "fields": [
+            {"name": "appeal_court", "label": "Апеляційний суд", "type": "text", "required": True},
+            {"name": "first_instance_court", "label": "Суд першої інстанції", "type": "text", "required": True},
+            {"name": "case_number", "label": "Номер справи", "type": "text", "required": True},
+            {"name": "appellant_name", "label": "Апелянт", "type": "text", "required": True},
+            {"name": "contested_decision_date", "label": "Дата рішення", "type": "date", "required": True},
+            {"name": "appeal_grounds", "label": "Підстави оскарження", "type": "textarea", "required": True},
+            {"name": "requests", "label": "Вимоги апеляції", "type": "textarea", "required": True},
+        ],
+    },
+    "dohovir_kupivli_prodazhu": {
+        "title": "Схема для договору купівлі-продажу",
+        "fields": [
+            {"name": "seller_name", "label": "Продавець", "type": "text", "required": True},
+            {"name": "buyer_name", "label": "Покупець", "type": "text", "required": True},
+            {"name": "subject", "label": "Предмет договору", "type": "textarea", "required": True},
+            {"name": "price", "label": "Ціна", "type": "number", "required": True},
+            {"name": "payment_terms", "label": "Умови оплати", "type": "textarea", "required": True},
+            {"name": "delivery_terms", "label": "Умови передачі", "type": "textarea", "required": False},
+        ],
+    },
+    "dohovir_orendi": {
+        "title": "Схема для договору оренди",
+        "fields": [
+            {"name": "lessor_name", "label": "Орендодавець", "type": "text", "required": True},
+            {"name": "lessee_name", "label": "Орендар", "type": "text", "required": True},
+            {"name": "rent_object", "label": "Об’єкт оренди", "type": "textarea", "required": True},
+            {"name": "rent_amount", "label": "Орендна плата", "type": "number", "required": True},
+            {"name": "term", "label": "Строк оренди", "type": "text", "required": True},
+            {"name": "termination_terms", "label": "Порядок розірвання", "type": "textarea", "required": False},
+        ],
+    },
+    "dohovir_nadannia_posluh": {
+        "title": "Схема для договору послуг",
+        "fields": [
+            {"name": "provider_name", "label": "Виконавець", "type": "text", "required": True},
+            {"name": "customer_name", "label": "Замовник", "type": "text", "required": True},
+            {"name": "service_scope", "label": "Перелік послуг", "type": "textarea", "required": True},
+            {"name": "price", "label": "Вартість", "type": "number", "required": True},
+            {"name": "deadline", "label": "Строк виконання", "type": "text", "required": False},
+            {"name": "acceptance_terms", "label": "Порядок приймання", "type": "textarea", "required": False},
+        ],
+    },
+    "pretenziya": {
+        "title": "Схема для претензії",
+        "fields": [
+            {"name": "recipient_name", "label": "Адресат", "type": "text", "required": True},
+            {"name": "sender_name", "label": "Заявник", "type": "text", "required": True},
+            {"name": "contract_reference", "label": "Посилання на договір", "type": "text", "required": False},
+            {"name": "violation_description", "label": "Опис порушення", "type": "textarea", "required": True},
+            {"name": "claim_amount", "label": "Сума претензії", "type": "number", "required": False},
+            {"name": "deadline_to_respond", "label": "Строк для відповіді", "type": "date", "required": False},
+            {"name": "requests", "label": "Вимоги", "type": "textarea", "required": True},
+        ],
+    },
+    "dovirennist": {
+        "title": "Схема для довіреності",
+        "fields": [
+            {"name": "principal_name", "label": "Довіритель", "type": "text", "required": True},
+            {"name": "agent_name", "label": "Представник", "type": "text", "required": True},
+            {"name": "powers", "label": "Повноваження", "type": "textarea", "required": True},
+            {"name": "valid_until", "label": "Строк дії", "type": "date", "required": False},
+            {"name": "place", "label": "Місце видачі", "type": "text", "required": False},
+        ],
+    },
 }
 
 
@@ -872,6 +1636,79 @@ class GenerateRequest(BaseModel):
     style: str | None = None
 
 
+class AsyncGenerateRequest(BaseModel):
+    doc_type: str
+    form_data: dict = {}
+    tariff: str = "FREE"
+    extra_prompt_context: str | None = None
+
+
+class AsyncJobStatusResponse(BaseModel):
+    job_id: str
+    task_id: str
+    status: str
+    progress: int = 0
+    message: str | None = None
+    result: dict | None = None
+    error: str | None = None
+
+
+async def _create_async_job(
+    session: AsyncSession,
+    uid: str,
+    task_id: str,
+    job_type: str,
+    payload: dict[str, Any],
+) -> str:
+    job_id = str(uuid.uuid4())
+    await session.execute(
+        text(
+            """
+            INSERT INTO async_jobs (id, user_id, task_id, job_type, status, payload)
+            VALUES (:id, :uid, :task_id, :job_type, 'queued', :payload::jsonb)
+            """
+        ),
+        {"id": job_id, "uid": uid, "task_id": task_id, "job_type": job_type, "payload": json.dumps(payload, ensure_ascii=False)},
+    )
+    await session.commit()
+    return job_id
+
+
+async def _dead_letter_once(
+    session: AsyncSession,
+    uid: str,
+    task_id: str,
+    job_type: str,
+    error_message: str,
+    meta: dict[str, Any] | None = None,
+) -> None:
+    exists = (
+        await session.execute(
+            text("SELECT 1 FROM dead_letter_jobs WHERE task_id = :task_id AND user_id = :uid LIMIT 1"),
+            {"task_id": task_id, "uid": uid},
+        )
+    ).first()
+    if exists:
+        return
+    await session.execute(
+        text(
+            """
+            INSERT INTO dead_letter_jobs (id, user_id, task_id, job_type, error_message, meta)
+            VALUES (:id, :uid, :task_id, :job_type, :error_message, :meta::jsonb)
+            """
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "uid": uid,
+            "task_id": task_id,
+            "job_type": job_type,
+            "error_message": error_message[:2000],
+            "meta": json.dumps(meta or {}, ensure_ascii=False),
+        },
+    )
+    await session.commit()
+
+
 @app.post("/api/documents/generate")
 async def generate_document(
     body: GenerateRequest,
@@ -897,8 +1734,24 @@ async def generate_document(
             detail=f"Ліміт документів вичерпано ({docs_used}/{docs_limit}). Оновіть тариф.",
         )
 
+    # Legal Brain grounding: retrieval -> prompt context -> citations
+    retrieval_query = " ".join([body.doc_type, *[str(v) for v in body.form_data.values() if v]])[:1500]
+    retrieved_chunks = await _retrieve_legal_chunks(session, uid, retrieval_query, top_k=5)
+    citations = _build_citations(retrieved_chunks)
+    citation_context = ""
+    if citations:
+        blocks = []
+        for c in citations:
+            blocks.append(
+                f"[{c['citation_id']}] {c.get('code') or ''} {c.get('locator') or ''}\n"
+                f"{c.get('evidence_span') or ''}"
+            )
+        citation_context = "Нормативні джерела (RAG):\n" + "\n\n".join(blocks)
+    merged_extra_context = "\n\n".join([x for x in [citation_context, body.extra_prompt_context] if x])
+
     # Generate with AI or fallback
-    generated_text = await _generate_text(body.doc_type, body.form_data, body.extra_prompt_context)
+    generated_text = await _generate_text(body.doc_type, body.form_data, merged_extra_context or None)
+    quality_metrics = _grounding_quality_metrics(generated_text, citations)
     preview = generated_text[:200] if generated_text else ""
     doc_title = _DOC_LABELS.get(body.doc_type, body.doc_type.replace("_", " ").title())
     ai_model = "claude-sonnet-4-6"
@@ -946,7 +1799,216 @@ async def generate_document(
         "has_pdf_export": False,
         "e_court_ready": False,
         "filing_blockers": [],
+        "citations": citations,
+        "quality_metrics": quality_metrics,
         "created_at": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/api/jobs/generate")
+async def enqueue_generate_job(
+    body: AsyncGenerateRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    sub_row = (
+        await session.execute(
+            text("SELECT docs_used, docs_limit FROM subscriptions WHERE user_id = :uid LIMIT 1"),
+            {"uid": uid},
+        )
+    ).mappings().first()
+    docs_used = sub_row["docs_used"] if sub_row else 0
+    docs_limit = sub_row["docs_limit"] if sub_row else 5
+    if docs_limit is not None and docs_used >= docs_limit:
+        raise HTTPException(status_code=402, detail=f"Ліміт документів вичерпано ({docs_used}/{docs_limit}).")
+
+    async_result = generate_document_job.delay(body.doc_type, body.form_data, body.extra_prompt_context)
+    job_id = await _create_async_job(
+        session,
+        uid,
+        async_result.id,
+        "generate_document",
+        {
+            "doc_type": body.doc_type,
+            "tariff": body.tariff,
+            "form_data": body.form_data,
+            "extra_prompt_context": body.extra_prompt_context,
+        },
+    )
+    return {"status": "queued", "job_id": job_id, "task_id": async_result.id}
+
+
+@app.post("/api/jobs/analyze-intake")
+async def enqueue_intake_job(
+    file: UploadFile = File(...),
+    jurisdiction: str = Form("UA"),
+    mode: str = Form("standard"),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    file_bytes = await file.read()
+    payload = {
+        "file_b64": base64.b64encode(file_bytes).decode("utf-8"),
+        "file_name": file.filename or "document",
+        "jurisdiction": jurisdiction,
+        "mode": mode,
+    }
+    async_result = analyze_intake_job.delay(payload)
+    job_id = await _create_async_job(session, uid, async_result.id, "analyze_intake", {"file_name": payload["file_name"]})
+    return {"status": "queued", "job_id": job_id, "task_id": async_result.id}
+
+
+@app.get("/api/jobs/{job_id}", response_model=AsyncJobStatusResponse)
+async def get_async_job_status(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    row = (
+        await session.execute(
+            text("SELECT * FROM async_jobs WHERE id = :id AND user_id = :uid LIMIT 1"),
+            {"id": job_id, "uid": uid},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    task_id = row["task_id"]
+    result = celery_app.AsyncResult(task_id)
+    state = (result.state or "PENDING").upper()
+    meta = result.info if isinstance(result.info, dict) else {}
+    progress = int(meta.get("progress", 0))
+    message = meta.get("message")
+    error = None
+    result_payload = None
+    status_value = "queued"
+
+    if state in {"PENDING"}:
+        status_value = "queued"
+    elif state in {"STARTED", "PROGRESS", "RETRY"}:
+        status_value = "running"
+        progress = max(progress, 10)
+    elif state == "SUCCESS":
+        status_value = "success"
+        progress = 100
+        result_payload = result.result if isinstance(result.result, dict) else {"raw": result.result}
+    else:
+        status_value = "failed"
+        progress = 100
+        error = str(result.result)[:2000]
+        await _dead_letter_once(
+            session,
+            uid,
+            task_id,
+            row["job_type"],
+            error,
+            {"state": state},
+        )
+
+    # Persist job status + result snapshot for auditability.
+    await session.execute(
+        text(
+            """
+            UPDATE async_jobs
+            SET status = :status,
+                retries = :retries,
+                result = COALESCE(:result::jsonb, result),
+                error_message = COALESCE(:error_message, error_message),
+                updated_at = NOW()
+            WHERE id = :id AND user_id = :uid
+            """
+        ),
+        {
+            "status": status_value,
+            "retries": int(getattr(result, "retries", 0) or 0),
+            "result": json.dumps(result_payload, ensure_ascii=False) if result_payload is not None else None,
+            "error_message": error,
+            "id": job_id,
+            "uid": uid,
+        },
+    )
+
+    # Finalize generated document once per job.
+    if status_value == "success" and row["job_type"] == "generate_document":
+        existing = (
+            await session.execute(
+                text(
+                    """
+                    SELECT id FROM generated_documents
+                    WHERE user_id = :uid AND title = :title AND created_at > NOW() - INTERVAL '10 minutes'
+                    ORDER BY created_at DESC LIMIT 1
+                    """
+                ),
+                {"uid": uid, "title": (result_payload or {}).get("title", "")},
+            )
+        ).mappings().first()
+        if not existing:
+            doc_id = str(uuid.uuid4())
+            payload = result_payload or {}
+            category = _DOC_CATEGORIES.get(payload.get("document_type", "pozov_do_sudu"), "civil")
+            # Legal Brain post-generation grounding for async jobs.
+            job_payload = row.get("payload") or {}
+            if isinstance(job_payload, str):
+                try:
+                    job_payload = json.loads(job_payload)
+                except Exception:
+                    job_payload = {}
+            query = " ".join(
+                [
+                    str(payload.get("document_type", "")),
+                    *[str(v) for v in (job_payload.get("form_data") or {}).values() if v],
+                ]
+            )[:1500]
+            retrieved_chunks = await _retrieve_legal_chunks(session, uid, query, top_k=5)
+            citations = _build_citations(retrieved_chunks)
+            payload["citations"] = citations
+            payload["quality_metrics"] = _grounding_quality_metrics(payload.get("generated_text", ""), citations)
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO generated_documents
+                      (id, user_id, document_type, document_category, title,
+                       generated_text, preview_text, ai_model, used_ai, created_at, updated_at)
+                    VALUES
+                      (:id, :uid, :dt, :cat, :title, :text, :preview, :model, :used_ai, NOW(), NOW())
+                    """
+                ),
+                {
+                    "id": doc_id,
+                    "uid": uid,
+                    "dt": payload.get("document_type", "pozov_do_sudu"),
+                    "cat": category,
+                    "title": payload.get("title", "Згенерований документ"),
+                    "text": payload.get("generated_text", ""),
+                    "preview": payload.get("preview_text", ""),
+                    "model": payload.get("ai_model", "claude-sonnet-4-6"),
+                    "used_ai": bool(payload.get("used_ai", True)),
+                },
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO subscriptions (user_id, plan, docs_used, docs_limit)
+                    VALUES (:uid, 'FREE', 1, 5)
+                    ON CONFLICT (user_id) DO UPDATE SET docs_used = subscriptions.docs_used + 1
+                    """
+                ),
+                {"uid": uid},
+            )
+            result_payload["document_id"] = doc_id
+
+    await session.commit()
+    return {
+        "job_id": job_id,
+        "task_id": task_id,
+        "status": status_value,
+        "progress": progress,
+        "message": message,
+        "result": result_payload,
+        "error": error,
     }
 
 
@@ -1202,12 +2264,101 @@ async def global_search(
     }
 
 
+def _required_processual_sections(doc_type: str) -> list[str]:
+    if doc_type in {"pozov_do_sudu", "pozov_trudovyi"}:
+        return ["СУД", "ПОЗИВАЧ", "ВІДПОВІДАЧ", "ОБСТАВИНИ", "ПРАВОВЕ ОБҐРУНТУВАННЯ", "ПРОШУ"]
+    if doc_type == "appeal_complaint":
+        return ["АПЕЛЯЦІЙНА СКАРГА", "СУД ПЕРШОЇ ІНСТАНЦІЇ", "ПІДСТАВИ ОСКАРЖЕННЯ", "ПРОШУ"]
+    if doc_type == "pretenziya":
+        return ["ПРЕТЕНЗІЯ", "ОПИС ПОРУШЕННЯ", "ВИМАГАЮ"]
+    return []
+
+
+def _find_processual_blockers(doc_type: str, text_value: str) -> list[str]:
+    text_u = (text_value or "").upper()
+    blockers: list[str] = []
+    for section in _required_processual_sections(doc_type):
+        if section not in text_u:
+            blockers.append(f"missing_section:{section}")
+    return blockers
+
+
+def _apply_rule_based_processual_repair(doc_type: str, text_value: str) -> str:
+    repaired = (text_value or "").strip()
+    if not repaired:
+        repaired = _template_document(doc_type, {})
+    for section in _required_processual_sections(doc_type):
+        if section not in repaired.upper():
+            repaired += f"\n\n{section}\n[Доповнити розділ]"
+    return repaired
+
+
+async def _repair_processual_text(doc_type: str, text_value: str) -> tuple[str, list[str], list[str]]:
+    blockers_before = _find_processual_blockers(doc_type, text_value)
+    repaired_text = _apply_rule_based_processual_repair(doc_type, text_value)
+    blockers_after_rules = _find_processual_blockers(doc_type, repaired_text)
+
+    if blockers_after_rules and os.getenv("ANTHROPIC_API_KEY"):
+        prompt = (
+            "Виправ процесуальний документ українською мовою. "
+            "Додай відсутні розділи без зміни суті.\n\n"
+            f"Тип документа: {doc_type}\n"
+            f"Обов'язкові розділи: {', '.join(_required_processual_sections(doc_type))}\n"
+            f"Поточний текст:\n{text_value or ''}\n"
+        )
+        try:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            message = client.messages.create(
+                model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+                max_tokens=3000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            ai_text = message.content[0].text if message and message.content else repaired_text
+            if ai_text:
+                repaired_text = ai_text
+        except Exception:
+            pass
+
+    blockers_after = _find_processual_blockers(doc_type, repaired_text)
+    return repaired_text, blockers_before, blockers_after
+
+
+async def _sync_submission_with_adapter(submission: dict[str, Any]) -> tuple[bool, str]:
+    provider = (submission.get("provider") or "manual").lower()
+    tracking_url = (submission.get("tracking_url") or "").strip()
+
+    if provider == "manual":
+        return False, "manual_provider_no_live_adapter"
+
+    if tracking_url:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(tracking_url)
+            if 200 <= resp.status_code < 300:
+                return True, "tracking_url_ok"
+            return False, f"tracking_url_status_{resp.status_code}"
+        except Exception as exc:
+            return False, f"tracking_url_error:{str(exc)[:120]}"
+
+    if provider == "opendatabot":
+        if not os.getenv("OPENDATABOT_API_KEY"):
+            return False, "missing_opendatabot_api_key"
+        return True, "provider_ready"
+
+    return False, f"provider_not_supported:{provider}"
+
+
 # ============================================================================
 # STUB ENDPOINTS (return empty/default so frontend doesn't break)
 # ============================================================================
 @app.get("/api/documents/form-schema/{doc_type}")
 async def get_form_schema(doc_type: str):
-    return {"fields": []}
+    schema = _FORM_SCHEMA_CATALOG.get(doc_type)
+    if not schema:
+        raise HTTPException(status_code=404, detail=f"Невідомий тип документа: {doc_type}")
+    return {"doc_type": doc_type, **schema}
 
 
 @app.get("/api/billing/invoices")
@@ -1311,6 +2462,75 @@ async def delete_deadline(
     )
     await session.commit()
     return {"status": "ok"}
+
+
+@app.post("/api/deadlines/notify-due")
+async def notify_due_deadlines(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    horizon_hours = int(body.get("horizon_hours", 24))
+    limit = max(1, min(int(body.get("limit", 100)), 500))
+    rows = (await session.execute(
+        text("""
+            SELECT id, title, end_date
+            FROM deadlines
+            WHERE user_id = :uid
+              AND reminder_sent = false
+              AND end_date IS NOT NULL
+              AND end_date <= NOW() + (:horizon || ' hours')::interval
+            ORDER BY end_date ASC
+            LIMIT :lim
+        """),
+        {"uid": uid, "horizon": horizon_hours, "lim": limit},
+    )).mappings().all()
+
+    notifications = []
+    for row in rows:
+        nid = str(uuid.uuid4())
+        message = f"Наближається дедлайн: {row.get('title')} ({row.get('end_date')})"
+        await session.execute(
+            text("""
+                INSERT INTO deadline_notifications (id, user_id, deadline_id, channel, message, scheduled_for, sent_at, status)
+                VALUES (:id, :uid, :did, 'in_app', :msg, NOW(), NOW(), 'sent')
+            """),
+            {"id": nid, "uid": uid, "did": row["id"], "msg": message},
+        )
+        await session.execute(
+            text("UPDATE deadlines SET reminder_sent = true WHERE id = :id AND user_id = :uid"),
+            {"id": row["id"], "uid": uid},
+        )
+        notifications.append({"id": nid, "deadline_id": str(row["id"]), "message": message})
+
+    await session.commit()
+    return {"processed": len(notifications), "items": notifications}
+
+
+@app.get("/api/deadlines/notifications")
+async def get_deadline_notifications(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text("""
+            SELECT * FROM deadline_notifications
+            WHERE user_id = :uid
+            ORDER BY created_at DESC
+            LIMIT :lim OFFSET :off
+        """),
+        {"uid": uid, "lim": page_size, "off": offset},
+    )).mappings().all()
+    total = (await session.execute(
+        text("SELECT COUNT(*) FROM deadline_notifications WHERE user_id = :uid"),
+        {"uid": uid},
+    )).scalar() or 0
+    return {"total": int(total), "page": page, "page_size": page_size, "items": [dict(r) for r in rows]}
 
 
 # ============================================================================
@@ -1993,6 +3213,53 @@ def _intake_row_to_dict(row: Any, usage: dict) -> dict:
     return r
 
 
+def _build_intake_structured_json(ai_result: dict, file_name: str, jurisdiction: str) -> dict:
+    issues = ai_result.get("detected_issues", []) or []
+    return {
+        "meta": {
+            "file_name": file_name,
+            "jurisdiction": jurisdiction,
+            "classified_type": ai_result.get("classified_type", "unknown"),
+            "language": ai_result.get("document_language"),
+        },
+        "parties": ai_result.get("identified_parties", []) or [],
+        "timeline": {
+            "document_date": ai_result.get("document_date"),
+            "deadline_from_document": ai_result.get("deadline_from_document"),
+            "urgency_level": ai_result.get("urgency_level", "medium"),
+        },
+        "risk_profile": {
+            "legal": ai_result.get("risk_level_legal", "medium"),
+            "procedural": ai_result.get("risk_level_procedural", "low"),
+            "financial": ai_result.get("risk_level_financial", "low"),
+            "issues_count": len(issues),
+        },
+        "subject_matter": ai_result.get("subject_matter"),
+        "issues": issues,
+        "tags": ai_result.get("tags", []) or [],
+    }
+
+
+def _extract_contract_pain_points(contract_text: str) -> dict:
+    text_l = contract_text.lower()
+    pain_points = []
+    if "штраф" in text_l or "пеня" in text_l:
+        pain_points.append({"type": "penalty_exposure", "severity": "high", "hint": "Високі штрафні санкції або пеня."})
+    if "односторон" in text_l and ("розір" in text_l or "відмов" in text_l):
+        pain_points.append({"type": "unilateral_termination", "severity": "high", "hint": "Одностороннє розірвання/відмова може бути ризикованим."})
+    if "автоматичн" in text_l and "пролонгац" in text_l:
+        pain_points.append({"type": "auto_renewal", "severity": "medium", "hint": "Автопролонгація без явного consent."})
+    if "конфіденц" in text_l and "відповідальн" not in text_l:
+        pain_points.append({"type": "nda_gap", "severity": "medium", "hint": "Є згадка про конфіденційність без чіткої відповідальності."})
+    if "форс-мажор" not in text_l and "force majeure" not in text_l:
+        pain_points.append({"type": "force_majeure_missing", "severity": "low", "hint": "Відсутній або слабкий блок форс-мажору."})
+    return {
+        "pain_points": pain_points,
+        "risk_score": min(100, 20 * len(pain_points)),
+        "total_flags": len(pain_points),
+    }
+
+
 @app.post("/api/analyze/intake")
 async def analyze_intake(
     file: UploadFile = File(...),
@@ -2076,7 +3343,9 @@ async def analyze_intake(
             text("SELECT * FROM document_intakes WHERE id = :id LIMIT 1"), {"id": rid}
         )
     ).mappings().first()
-    return _intake_row_to_dict(row, usage)
+    response = _intake_row_to_dict(row, usage)
+    response["structured_output"] = _build_intake_structured_json(ai_result, file_name, jurisdiction)
+    return response
 
 
 @app.post("/api/analyze/intake-stream")
@@ -2143,6 +3412,7 @@ async def analyze_intake_stream(
             "cache_hit": False,
             "usage": {"docs_used": 0, "docs_limit": 5},
         }
+        result["structured_output"] = _build_intake_structured_json(ai_result, file_name, jurisdiction)
 
         # Зберігаємо в БД з власною сесією (best-effort, не блокує відповідь)
         try:
@@ -2250,6 +3520,7 @@ async def process_contract_analysis(
         file_name,
         body.get("mode"),
     )
+    heuristic = _extract_contract_pain_points(contract_text)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     rid = str(uuid.uuid4())
     await session.execute(
@@ -2292,6 +3563,9 @@ async def process_contract_analysis(
         "medium_risks": result.get("medium_risks", []),
         "ok_points": result.get("ok_points", []),
         "recommendations": result.get("recommendations", []),
+        "pain_points": heuristic["pain_points"],
+        "risk_score": heuristic["risk_score"],
+        "total_flags": heuristic["total_flags"],
         "summary": result.get("summary"),
         "ai_model": result.get("ai_model", "demo"),
         "tokens_used": result.get("tokens_used", 0),
@@ -2477,12 +3751,68 @@ async def create_precedent_map(
     current_user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    # Stub — returns empty map (real precedent search requires vector DB)
+    uid = str(current_user["id"])
+    intake = (
+        await session.execute(
+            text("SELECT subject_matter, tags FROM document_intakes WHERE id = :id AND user_id = :uid LIMIT 1"),
+            {"id": intake_id, "uid": uid},
+        )
+    ).mappings().first()
+    if not intake:
+        raise HTTPException(status_code=404, detail="Intake не знайдено")
+
+    tags = intake.get("tags")
+    if isinstance(tags, str):
+        try:
+            tags = json.loads(tags)
+        except Exception:
+            tags = []
+    terms = [str(t).strip() for t in (tags or []) if str(t).strip()]
+    if intake.get("subject_matter"):
+        terms.insert(0, str(intake["subject_matter"]))
+    query_used = " ".join(terms[:4]).strip()
+    if not query_used:
+        query_used = "цивільний спір"
+
+    rows = (
+        await session.execute(
+            text("""
+                SELECT id, case_number, court_name, decision_date, summary, relevance_score
+                FROM case_law_items
+                WHERE user_id = :uid
+                  AND (
+                    summary ILIKE :q
+                    OR case_number ILIKE :q
+                    OR court_name ILIKE :q
+                  )
+                ORDER BY COALESCE(relevance_score, 0) DESC, decision_date DESC
+                LIMIT :lim
+            """),
+            {"uid": uid, "q": f"%{query_used[:120]}%", "lim": max(1, min(limit, 30))},
+        )
+    ).mappings().all()
+
+    groups_map: dict[str, list] = {}
+    refs = []
+    for row in rows:
+        court = str(row.get("court_name") or "Невідомий суд")
+        groups_map.setdefault(court, []).append(
+            {
+                "id": str(row["id"]),
+                "case_number": row.get("case_number"),
+                "decision_date": str(row.get("decision_date") or ""),
+                "summary": row.get("summary"),
+                "relevance_score": float(row.get("relevance_score") or 0),
+            }
+        )
+        refs.append({"id": str(row["id"]), "court_name": court, "case_number": row.get("case_number")})
+
+    groups = [{"court_name": court, "items": items} for court, items in groups_map.items()]
     return {
         "intake_id": intake_id,
-        "query_used": "",
-        "groups": [],
-        "refs": [],
+        "query_used": query_used,
+        "groups": groups,
+        "refs": refs,
     }
 
 
@@ -2767,8 +4097,84 @@ async def processual_gate_check(body: dict, current_user: dict = Depends(get_cur
 
 
 @app.post("/api/documents/bulk-processual-repair")
-async def bulk_processual_repair(body: dict, current_user: dict = Depends(get_current_user)):
-    return {"repaired": 0, "items": []}
+async def bulk_processual_repair(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    ids = [str(x) for x in (body.get("ids") or []) if str(x).strip()]
+    if not ids:
+        return {
+            "status": "ok",
+            "requested": 0,
+            "processed": 0,
+            "repaired": 0,
+            "missing_ids": [],
+            "items": [],
+        }
+
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT id, document_type, generated_text
+                FROM generated_documents
+                WHERE user_id = :uid AND id = ANY(:ids)
+                """
+            ),
+            {"uid": uid, "ids": ids},
+        )
+    ).mappings().all()
+    rows_by_id = {str(r["id"]): r for r in rows}
+    missing_ids = [doc_id for doc_id in ids if doc_id not in rows_by_id]
+
+    repaired_count = 0
+    items: list[dict[str, Any]] = []
+
+    for doc_id in ids:
+        row = rows_by_id.get(doc_id)
+        if not row:
+            continue
+        original_text = row.get("generated_text") or ""
+        repaired_text, blockers_before, blockers_after = await _repair_processual_text(
+            row["document_type"], original_text
+        )
+        repaired = repaired_text != original_text
+        if repaired:
+            repaired_count += 1
+            await session.execute(
+                text(
+                    """
+                    UPDATE generated_documents
+                    SET generated_text = :text,
+                        preview_text = :preview,
+                        updated_at = NOW()
+                    WHERE id = :id AND user_id = :uid
+                    """
+                ),
+                {"id": doc_id, "uid": uid, "text": repaired_text, "preview": repaired_text[:200]},
+            )
+        items.append(
+            {
+                "id": doc_id,
+                "status": "repaired" if repaired else "checked",
+                "repaired": repaired,
+                "is_valid": len(blockers_after) == 0,
+                "blockers": blockers_after,
+                "blockers_before": blockers_before,
+            }
+        )
+
+    await session.commit()
+    return {
+        "status": "ok",
+        "requested": len(ids),
+        "processed": len(rows),
+        "repaired": repaired_count,
+        "missing_ids": missing_ids,
+        "items": items,
+    }
 
 
 # ============================================================================
@@ -2802,7 +4208,46 @@ async def get_ecourt_hearings(
     session: AsyncSession = Depends(get_session),
 ):
     uid = str(current_user["id"])
-    return {"items": [], "total": 0}
+    params: dict[str, Any] = {"uid": uid}
+    filters = ["s.user_id = :uid", "s.status IN ('submitted', 'accepted', 'in_review')"]
+    if case_id:
+        filters.append("d.case_id = :case_id")
+        params["case_id"] = case_id
+    where = " AND ".join(filters)
+    rows = (
+        await session.execute(
+            text(
+                f"""
+                SELECT
+                    s.id,
+                    s.status,
+                    s.court_name,
+                    s.submitted_at AS hearing_at,
+                    COALESCE(d.title, 'Подання до е-суду') AS title,
+                    d.case_id
+                FROM ecourt_submissions s
+                LEFT JOIN generated_documents d ON d.id = s.document_id
+                WHERE {where}
+                ORDER BY s.submitted_at DESC
+                LIMIT 100
+                """
+            ),
+            params,
+        )
+    ).mappings().all()
+    items = [
+        {
+            "id": str(r["id"]),
+            "case_id": str(r["case_id"]) if r.get("case_id") else None,
+            "title": r.get("title") or "Подання до е-суду",
+            "court_name": r.get("court_name") or "",
+            "status": r.get("status") or "submitted",
+            "hearing_at": r["hearing_at"].isoformat() if hasattr(r.get("hearing_at"), "isoformat") else r.get("hearing_at"),
+            "source": "ecourt_submissions",
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": len(items)}
 
 
 # ============================================================================
@@ -2941,6 +4386,31 @@ async def _odb_get(path: str, params: dict | None = None) -> Any:
     return resp.json()
 
 
+def _extract_pdf_links_from_case_payload(payload: dict) -> list[str]:
+    links: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for v in value.values():
+                collect(v)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+        if isinstance(value, str) and value.lower().startswith(("http://", "https://")) and ".pdf" in value.lower():
+            links.append(value)
+
+    collect(payload)
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for link in links:
+        if link not in seen:
+            seen.add(link)
+            dedup.append(link)
+    return dedup
+
+
 @app.get("/api/opendatabot/court-cases/{case_number}")
 async def get_court_case(
     case_number: str,
@@ -3063,12 +4533,37 @@ async def sync_ecourt_status(
     current_user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
+    uid = str(current_user["id"])
     row = (await session.execute(
-        text("SELECT * FROM ecourt_submissions WHERE id = :id LIMIT 1"), {"id": submission_id}
+        text("SELECT * FROM ecourt_submissions WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": submission_id, "uid": uid},
     )).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Подання не знайдено")
-    return {"submission": dict(row), "synced_live": False}
+    submission = dict(row)
+    synced_live, sync_reason = await _sync_submission_with_adapter(submission)
+
+    status_value = submission.get("status") or "submitted"
+    if synced_live and status_value == "submitted":
+        status_value = "in_review"
+
+    await session.execute(
+        text(
+            """
+            UPDATE ecourt_submissions
+            SET status = :status, updated_at = NOW()
+            WHERE id = :id AND user_id = :uid
+            """
+        ),
+        {"status": status_value, "id": submission_id, "uid": uid},
+    )
+    await session.commit()
+
+    refreshed = (await session.execute(
+        text("SELECT * FROM ecourt_submissions WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": submission_id, "uid": uid},
+    )).mappings().first()
+    return {"submission": dict(refreshed) if refreshed else submission, "synced_live": synced_live, "sync_reason": sync_reason}
 
 
 @app.get("/api/e-court/public-search")
@@ -3092,6 +4587,25 @@ async def ecourt_public_search(
                 return {"status": "not_found", "case_number": case_number, "assignments": [], "history": []}
             raise
     return {"status": "no_key", "case_number": case_number, "assignments": [], "history": []}
+
+
+@app.get("/api/e-court/public-search/pdf")
+async def ecourt_public_search_pdf(
+    case_number: str = Query(""),
+    current_user: dict = Depends(get_current_user),
+):
+    if not case_number.strip():
+        raise HTTPException(status_code=400, detail="Номер справи обов'язковий")
+    if not _ODB_KEY:
+        return {
+            "status": "no_key",
+            "case_number": case_number,
+            "pdf_links": [],
+            "message": "OPENDATABOT_API_KEY не налаштований",
+        }
+    payload = await _odb_get("/v1/court/case", params={"number": case_number})
+    pdf_links = _extract_pdf_links_from_case_payload(payload if isinstance(payload, dict) else {})
+    return {"status": "ok", "case_number": case_number, "pdf_links": pdf_links}
 
 
 # ============================================================================
@@ -3228,6 +4742,13 @@ async def check_watch_item(
                     WHERE id = :id"""),
                 {"snap": json.dumps(data, ensure_ascii=False), "changed": event_type == "state_changed", "id": item_id},
             )
+            await session.execute(
+                text("""
+                    INSERT INTO registry_snapshots (id, user_id, watch_item_id, snapshot, source)
+                    VALUES (:id, :uid, :wid, :snap::jsonb, 'opendatabot')
+                """),
+                {"id": str(uuid.uuid4()), "uid": uid, "wid": item_id, "snap": json.dumps(data, ensure_ascii=False)},
+            )
         except Exception as e:
             details = {"error": str(e)}
     else:
@@ -3251,6 +4772,42 @@ async def check_watch_item(
     )).mappings().first()
     return {"status": "checked", "item": dict(row) if row else item,
             "event_id": eid, "event_type": event_type}
+
+
+@app.get("/api/monitoring/watch-items/{item_id}/history")
+async def get_watch_item_history(
+    item_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    offset = (page - 1) * page_size
+    rows = (await session.execute(
+        text("""
+            SELECT id, watch_item_id, snapshot, source, created_at
+            FROM registry_snapshots
+            WHERE user_id = :uid AND watch_item_id = :wid
+            ORDER BY created_at DESC
+            LIMIT :lim OFFSET :off
+        """),
+        {"uid": uid, "wid": item_id, "lim": page_size, "off": offset},
+    )).mappings().all()
+    total = (await session.execute(
+        text("SELECT COUNT(*) FROM registry_snapshots WHERE user_id = :uid AND watch_item_id = :wid"),
+        {"uid": uid, "wid": item_id},
+    )).scalar() or 0
+    items = []
+    for row in rows:
+        d = dict(row)
+        if isinstance(d.get("snapshot"), str):
+            try:
+                d["snapshot"] = json.loads(d["snapshot"])
+            except Exception:
+                d["snapshot"] = {}
+        items.append(d)
+    return {"total": int(total), "page": page, "page_size": page_size, "items": items}
 
 
 @app.get("/api/monitoring/events")

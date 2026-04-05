@@ -15,9 +15,9 @@ import {
   type GenerateResponse,
   type GenerateBundleResponse,
   type TargetLanguage,
-  type StreamEvent,
   generateDocument,
-  generateDocumentStream,
+  enqueueGenerateJob,
+  waitForAsyncJobResult,
   getCase,
   getCaseLawDigest,
   getCaseLawDigestDetail,
@@ -425,15 +425,25 @@ function GeneratePageInner() {
     setGenProgress("");
 
     const targetType = isBundleMode ? "bundle" : selectedDocType;
+    enqueueGenerateJob(targetType, payload, tariff, getToken(), getUserId(), options)
+      .then(async (queued) => {
+        setGenProgress("Задачу поставлено в чергу…");
+        const finalStatus = await waitForAsyncJobResult(
+          queued.job_id,
+          (status) => {
+            const progress = Number.isFinite(status.progress) ? status.progress : 0;
+            const msg = status.message ?? (status.status === "running" ? "Виконується…" : "Очікування…");
+            setGenProgress(`${msg} (${progress}%)`);
+          },
+          getToken(),
+          getUserId(),
+          180_000
+        );
 
-    generateDocumentStream(
-      targetType, payload, tariff,
-      (event: StreamEvent) => {
-        if (event.message) setGenProgress(event.message);
-      },
-      getToken(), getUserId(), options
-    )
-      .then((data) => {
+        if (finalStatus.status !== "success" || !finalStatus.result) {
+          throw new Error(finalStatus.error || "Генерація не завершилась успішно.");
+        }
+        const data = finalStatus.result as unknown as GenerateResponse | GenerateBundleResponse;
         setResult(data);
         setGenProgress("");
         if ("bundle_id" in data) {
@@ -441,7 +451,6 @@ function GeneratePageInner() {
         } else {
           setInfo(`Документ згенеровано: ${data.title}.`);
         }
-        // Persist current settings as user preferences (fire-and-forget)
         updateUserPreferences(
           {
             gen_mode: genMode,

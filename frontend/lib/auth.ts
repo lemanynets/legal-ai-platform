@@ -273,6 +273,35 @@ async function _backendRegister(email: string, password: string, fullName?: stri
   return session;
 }
 
+export function setSessionFromAccessToken(params: {
+  access_token: string;
+  email?: string;
+  name?: string;
+  fallbackPlan?: string;
+}): UserSession {
+  const token = params.access_token;
+  const payload = safeDecodeTokenPayload(token);
+  const payloadEmail = String(payload.email || "").trim();
+  const resolvedEmail = params.email?.trim() || payloadEmail || "kep-user@local";
+  const resolvedName =
+    params.name?.trim() ||
+    String(payload.full_name || "").trim() ||
+    String(payload.name || "").trim() ||
+    resolvedEmail.split("@")[0];
+  const userId = String(payload.sub || "").trim() || resolvedEmail.split("@")[0].replace(/[^a-z0-9]/gi, "-");
+
+  const session = buildSession({
+    userId,
+    email: resolvedEmail,
+    name: resolvedName,
+    token,
+    fallbackPlan: params.fallbackPlan || "PRO",
+  });
+  cachedSession = session;
+  persistSession(session);
+  return session;
+}
+
 export async function login(email: string, password: string): Promise<UserSession> {
   // Always use real backend when a production URL is configured.
   if (hasProductionBackend()) {
