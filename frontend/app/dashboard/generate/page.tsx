@@ -485,25 +485,61 @@ function GeneratePageInner() {
     return result as GenerateResponse;
   }, [result, activeBundleItemIndex]);
 
+  // Sync URL mode param with bundle state
+  const urlMode = searchParams.get("mode") || "single";
+  const isPackageMode = urlMode === "package" || isBundleMode;
+
+  useEffect(() => {
+    if (urlMode === "package" && !isBundleMode) setIsBundleMode(true);
+    if (urlMode === "single" && isBundleMode) setIsBundleMode(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urlMode]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
       <div className="section-header">
         <div>
           <h1 className="section-title">Генерація документів</h1>
           <p className="section-subtitle">
-            Крок 4 ядра продукту: на базі форми, практики й додаткового юридичного контексту формується готовий процесуальний документ.
+            {isPackageMode
+              ? "Пакетна генерація: набори документів для типових правових ситуацій."
+              : "Генерація окремого документа: форма, стиль, прецеденти, AI-контекст."}
           </p>
         </div>
         <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-          <Link href="/dashboard/strategy-studio" className="btn btn-secondary btn-sm">
-            До Strategy Studio
-          </Link>
           {result && (
             <Link href="/dashboard/documents" className="btn btn-secondary btn-sm">
               Відкрити мої документи
             </Link>
           )}
         </div>
+      </div>
+
+      {/* Mode tabs */}
+      <div style={{ display: "flex", gap: "8px", borderBottom: "1px solid rgba(255,255,255,0.07)" }}>
+        {[
+          { key: "single", label: "Документ" },
+          { key: "package", label: "Пакет" },
+        ].map(({ key, label }) => (
+          <Link
+            key={key}
+            href={`/dashboard/generate?mode=${key}`}
+            onClick={() => setIsBundleMode(key === "package")}
+            style={{
+              display: "inline-block",
+              padding: "10px 20px",
+              textDecoration: "none",
+              fontSize: "14px",
+              fontWeight: isPackageMode === (key === "package") ? 700 : 400,
+              color: isPackageMode === (key === "package") ? "var(--gold-400)" : "var(--text-secondary)",
+              borderBottom: isPackageMode === (key === "package") ? "2px solid var(--gold-400)" : "2px solid transparent",
+              marginBottom: "-1px",
+              transition: "all 0.2s",
+            }}
+          >
+            {label}
+          </Link>
+        ))}
       </div>
 
       {info && (

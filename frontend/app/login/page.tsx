@@ -3,6 +3,7 @@
 import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { login, registerUser, devLogin, isDevAuthEnabled } from "@/lib/auth";
+import KepLoginButton from "@/app/components/KepLoginButton";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -176,7 +177,18 @@ export default function LoginPage() {
             </button>
           </form>
 
-          <hr className="divider" style={{ margin: "24px 0 20px" }} />
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", margin: "24px 0 16px" }}>
+            <div style={{ flex: 1, height: "1px", background: "rgba(255,255,255,0.08)" }} />
+            <span style={{ fontSize: "12px", color: "var(--text-muted)", whiteSpace: "nowrap" }}>або</span>
+            <div style={{ flex: 1, height: "1px", background: "rgba(255,255,255,0.08)" }} />
+          </div>
+
+          <KepLoginButton
+            onSuccess={() => router.replace("/dashboard")}
+            onError={(msg) => setError(msg)}
+          />
+
+          <hr className="divider" style={{ margin: "20px 0" }} />
 
           {isDevAuthEnabled && (
             <div style={{

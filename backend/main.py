@@ -19,11 +19,12 @@ from typing import Any, Optional
 import asyncio
 import pathlib
 import time
+from collections import defaultdict
 
 import httpx
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -53,6 +54,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Rate limiting (in-memory sliding window, per IP) ─────────────────────────
+class _RateLimiter:
+    """Thread-safe in-memory sliding-window rate limiter.
+
+    Stores per-key timestamp lists.  Old entries are pruned on each call so
+    memory stays bounded.  Not suitable for multi-process deployments (use
+    Redis in that case), but fine for single-process Railway services.
+    """
+
+    def __init__(self) -> None:
+        self._windows: dict[str, list[float]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+
+    async def is_allowed(self, key: str, limit: int, window: int = 60) -> bool:
+        now = time.monotonic()
+        async with self._lock:
+            ts = self._windows[key]
+            # prune expired
+            cutoff = now - window
+            self._windows[key] = [t for t in ts if t > cutoff]
+            if len(self._windows[key]) >= limit:
+                return False
+            self._windows[key].append(now)
+            return True
+
+_rate_limiter = _RateLimiter()
+
+# Rules: (path_prefix, requests_per_minute)
+_RATE_RULES: list[tuple[str, int]] = [
+    ("/api/analyze/",            10),
+    ("/api/auto/",               10),
+    ("/api/strategy/",           10),
+    ("/api/documents/generate",   5),
+    ("/api/auth/login",          10),   # brute-force захист
+    ("/api/auth/register",       10),
+    ("/api/auth/kep/",           20),   # КЕП має більший ліміт (challenge+verify = 2 req)
+]
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):  # type: ignore[type-arg]
+    path = request.url.path
+    ip = request.client.host if request.client else "unknown"
+    for prefix, limit in _RATE_RULES:
+        if path.startswith(prefix):
+            key = f"{ip}:{prefix}"
+            allowed = await _rate_limiter.is_allowed(key, limit)
+            if not allowed:
+                origin = request.headers.get("origin", "")
+                cors_origin = origin if origin in ALLOWED_ORIGINS else (ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else "*")
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": f"Забагато запитів. Максимум {limit} запитів/хв для {prefix}. Спробуйте пізніше."
+                    },
+                    headers={
+                        "Retry-After": "60",
+                        "Access-Control-Allow-Origin": cors_origin,
+                        "Access-Control-Allow-Credentials": "true",
+                    },
+                )
+            break  # only apply first matching rule
+    return await call_next(request)
+
+# ── Routers ───────────────────────────────────────────────────────────────────
+from routers.kep import router as kep_router  # noqa: E402
+app.include_router(kep_router)
+
 # ── Startup: create tables ────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
@@ -80,6 +148,8 @@ _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS logo_url TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS kep_serial TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_kep_serial ON users(kep_serial) WHERE kep_serial IS NOT NULL",
     """CREATE TABLE IF NOT EXISTS subscriptions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -332,6 +402,31 @@ _MIGRATIONS = [
         created_at TIMESTAMPTZ DEFAULT NOW()
     )""",
     "CREATE INDEX IF NOT EXISTS idx_document_versions_doc_id ON document_versions(document_id)",
+    # ── Intake cache (MD5 dedup) ─────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS intake_cache (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_md5 TEXT NOT NULL UNIQUE,
+    file_name TEXT,
+    result_json JSONB NOT NULL DEFAULT '{}',
+    hit_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_hit_at TIMESTAMPTZ DEFAULT NOW()
+)""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_cache_md5 ON intake_cache(file_md5)",
+    # ── Analytics events ─────────────────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS analytics_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    entity_type TEXT,
+    entity_id TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    session_id TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+)""",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_events_user_id ON analytics_events(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_events_event_type ON analytics_events(event_type)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_events_created_at ON analytics_events(created_at DESC)",
 ]
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
@@ -340,10 +435,14 @@ ALLOW_DEV_AUTH = os.getenv("ALLOW_DEV_AUTH", "false").lower() == "true"
 _bearer = HTTPBearer(auto_error=False)
 
 
+_TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", str(30 * 24 * 3600)))  # 30 days default
+
+
 def _make_token(user_id: str, email: str) -> str:
     """3-part token: header.payload.sig  (JWT-compatible structure for frontend decoder)."""
     header = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
-    payload_json = json.dumps({"sub": user_id, "email": email})
+    now = int(time.time())
+    payload_json = json.dumps({"sub": user_id, "email": email, "iat": now, "exp": now + _TOKEN_TTL_SECONDS})
     payload = base64.urlsafe_b64encode(payload_json.encode()).decode().rstrip("=")
     signing_input = f"{header}.{payload}".encode()
     sig = hmac.new(_SECRET.encode(), signing_input, hashlib.sha256).hexdigest()
@@ -360,7 +459,12 @@ def _decode_token(token: str) -> dict[str, str] | None:
             if not hmac.compare_digest(sig, expected):
                 return None
             payload_bytes = base64.urlsafe_b64decode(payload_b64 + "==")
-            return json.loads(payload_bytes)
+            data = json.loads(payload_bytes)
+            # Validate expiration if present
+            exp = data.get("exp")
+            if exp and int(time.time()) > exp:
+                return None
+            return data
         if len(parts) == 2:
             # Legacy 2-part format (backward compat)
             payload_b64, sig = parts
@@ -1376,18 +1480,23 @@ async def get_case_law_digest(
         conditions.append("(title ILIKE :q OR summary ILIKE :q)")
         params["q"] = f"%{q}%"
     where = " AND ".join(conditions)
-    count_row = (await session.execute(
-        text(f"SELECT COUNT(*) FROM case_law_digest WHERE {where}"), params
-    )).scalar() or 0
-    offset = (page - 1) * page_size
-    rows = (await session.execute(
-        text(f"SELECT * FROM case_law_digest WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
-        {**params, "lim": page_size, "off": offset},
-    )).mappings().all()
+    try:
+        count_row = (await session.execute(
+            text(f"SELECT COUNT(*) FROM case_law_digest WHERE {where}"), params
+        )).scalar() or 0
+        offset = (page - 1) * page_size
+        rows = (await session.execute(
+            text(f"SELECT * FROM case_law_digest WHERE {where} ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+            {**params, "lim": page_size, "off": offset},
+        )).mappings().all()
+        items = [dict(r) for r in rows]
+    except Exception:
+        await session.rollback()
+        count_row, items = 0, []
     return {
         "total": count_row, "page": page, "page_size": page_size,
         "pages": max(1, -(-int(count_row) // page_size)),
-        "items": [dict(r) for r in rows],
+        "items": items,
     }
 
 
@@ -1399,16 +1508,21 @@ async def get_digest_history(
     session: AsyncSession = Depends(get_session),
 ):
     uid = str(current_user["id"])
-    count_row = (await session.execute(
-        text("SELECT COUNT(*) FROM case_law_digest WHERE user_id = :uid"), {"uid": uid}
-    )).scalar() or 0
-    offset = (page - 1) * page_size
-    rows = (await session.execute(
-        text("SELECT * FROM case_law_digest WHERE user_id = :uid ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
-        {"uid": uid, "lim": page_size, "off": offset},
-    )).mappings().all()
+    try:
+        count_row = (await session.execute(
+            text("SELECT COUNT(*) FROM case_law_digest WHERE user_id = :uid"), {"uid": uid}
+        )).scalar() or 0
+        offset = (page - 1) * page_size
+        rows = (await session.execute(
+            text("SELECT * FROM case_law_digest WHERE user_id = :uid ORDER BY created_at DESC LIMIT :lim OFFSET :off"),
+            {"uid": uid, "lim": page_size, "off": offset},
+        )).mappings().all()
+        items = [dict(r) for r in rows]
+    except Exception:
+        await session.rollback()
+        count_row, items = 0, []
     return {"total": count_row, "page": page, "page_size": page_size,
-            "pages": max(1, -(-int(count_row) // page_size)), "items": [dict(r) for r in rows]}
+            "pages": max(1, -(-int(count_row) // page_size)), "items": items}
 
 
 @app.get("/api/case-law/digest/history/{digest_id}")
@@ -2477,12 +2591,110 @@ async def create_precedent_map(
     current_user: dict = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    # Stub — returns empty map (real precedent search requires vector DB)
+    uid = str(current_user["id"])
+    intake_row = (await session.execute(
+        text("SELECT * FROM document_intakes WHERE id = :id AND user_id = :uid LIMIT 1"),
+        {"id": intake_id, "uid": uid},
+    )).mappings().first()
+    if not intake_row:
+        raise HTTPException(status_code=404, detail="Аналіз не знайдено")
+
+    intake = dict(intake_row)
+    doc_type = intake.get("doc_type") or intake.get("document_type") or "цивільний спір"
+    tags = intake.get("tags") or []
+    issues = intake.get("detected_issues") or []
+    exposure = intake.get("financial_exposure_amount")
+
+    # Search local case law first
+    local_rows = (await session.execute(
+        text("""
+            SELECT id, title, court, date, summary, relevance_score, url
+            FROM case_law_items
+            WHERE user_id = :uid
+            ORDER BY relevance_score DESC NULLS LAST, date DESC
+            LIMIT 20
+        """),
+        {"uid": uid},
+    )).mappings().all()
+    local_cases = [dict(r) for r in local_rows]
+
+    # Build AI prompt for precedent analysis
+    tags_str = ", ".join(tags[:10]) if tags else "загальні"
+    issues_str = "; ".join(str(i) for i in issues[:5]) if issues else "не визначено"
+    local_cases_preview = "\n".join(
+        f"- {c.get('title','?')} ({c.get('court','?')}, {c.get('date','?')}): {(c.get('summary') or '')[:200]}"
+        for c in local_cases[:10]
+    ) or "Немає збережених прецедентів"
+
+    prompt = f"""Ти — аналітик судової практики України. Клієнт надав документ для аналізу.
+
+Тип документа: {doc_type}
+Теги: {tags_str}
+Виявлені проблеми: {issues_str}
+Фінансові вимоги: {exposure or 'не вказано'} грн
+
+Наявні прецеденти в базі:
+{local_cases_preview}
+
+Виконай:
+1. Визнач 3-5 ключових правових питань з цієї справи
+2. Для кожного питання — знайди або запропонуй релевантні прецеденти (реальні або типові для практики ВС України)
+3. Оціни ймовірність успіху на основі практики
+4. Вкажи ключові аргументи, що спрацювали у схожих справах
+
+Відповідь ТІЛЬКИ у JSON:
+{{
+  "query_used": "стислий опис правового питання",
+  "win_probability": 0.0-1.0,
+  "legal_issues": ["питання 1", "питання 2"],
+  "groups": [
+    {{
+      "issue": "Правове питання",
+      "precedents": [
+        {{
+          "title": "Назва справи або типовий прецедент",
+          "court": "ВС/ВАС/ВГСУ/Апеляційний суд",
+          "year": 2023,
+          "outcome": "на користь позивача/відповідача",
+          "relevance_score": 0.0-1.0,
+          "key_argument": "Ключовий аргумент що спрацював",
+          "legal_basis": ["ст. 627 ЦКУ", "ст. 124 ГПК"],
+          "url": null
+        }}
+      ],
+      "recommendation": "Стратегічна рекомендація"
+    }}
+  ],
+  "strategic_summary": "Загальний висновок щодо перспектив справи"
+}}"""
+
+    ai_result = await _ai_json(prompt, max_tokens=3000)
+
+    # Merge AI result with local cases as refs
+    refs = [
+        {
+            "id": str(c.get("id", "")),
+            "title": c.get("title", ""),
+            "court": c.get("court", ""),
+            "date": str(c.get("date", "")),
+            "url": c.get("url"),
+            "relevance_score": float(c.get("relevance_score") or 0.5),
+        }
+        for c in local_cases[:limit]
+    ]
+
+    if not ai_result:
+        return {"intake_id": intake_id, "query_used": doc_type, "groups": [], "refs": refs,
+                "win_probability": None, "strategic_summary": "AI недоступний — додайте ANTHROPIC_API_KEY"}
+
     return {
         "intake_id": intake_id,
-        "query_used": "",
-        "groups": [],
-        "refs": [],
+        "query_used": ai_result.get("query_used", doc_type),
+        "win_probability": ai_result.get("win_probability"),
+        "legal_issues": ai_result.get("legal_issues", []),
+        "groups": ai_result.get("groups", []),
+        "refs": refs,
+        "strategic_summary": ai_result.get("strategic_summary", ""),
     }
 
 
@@ -2889,14 +3101,59 @@ async def update_team_user_role(
 # USER PREFERENCES
 # ============================================================================
 
+_PREF_DEFAULTS = {
+    "theme": "dark",
+    "language": "uk",
+    "notifications_enabled": True,
+    "email_frequency": "daily",
+    "default_doc_type": "pozov_do_sudu",
+    "sidebar_collapsed": False,
+    "items_per_page": 20,
+}
+
+
 @app.get("/api/users/me/preferences")
-async def get_preferences(current_user: dict = Depends(get_current_user)):
-    return {"theme": "dark", "language": "uk", "notifications": True}
+async def get_preferences(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    row = (await session.execute(
+        text("SELECT prefs FROM user_preferences WHERE user_id = :uid LIMIT 1"),
+        {"uid": uid},
+    )).mappings().first()
+    if row and row.get("prefs"):
+        stored = row["prefs"] if isinstance(row["prefs"], dict) else json.loads(row["prefs"])
+        return {**_PREF_DEFAULTS, **stored}
+    return _PREF_DEFAULTS
 
 
 @app.patch("/api/users/me/preferences")
-async def update_preferences(body: dict, current_user: dict = Depends(get_current_user)):
-    return {"status": "ok", **body}
+async def update_preferences(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    uid = str(current_user["id"])
+    # Merge with existing
+    row = (await session.execute(
+        text("SELECT prefs FROM user_preferences WHERE user_id = :uid LIMIT 1"),
+        {"uid": uid},
+    )).mappings().first()
+    existing = {}
+    if row and row.get("prefs"):
+        existing = row["prefs"] if isinstance(row["prefs"], dict) else json.loads(row["prefs"])
+    merged = {**_PREF_DEFAULTS, **existing, **body}
+    await session.execute(
+        text("""
+            INSERT INTO user_preferences (user_id, prefs)
+            VALUES (:uid, :prefs::jsonb)
+            ON CONFLICT (user_id) DO UPDATE SET prefs = :prefs::jsonb, updated_at = NOW()
+        """),
+        {"uid": uid, "prefs": json.dumps(merged)},
+    )
+    await session.commit()
+    return {"status": "ok", **merged}
 
 
 # ============================================================================

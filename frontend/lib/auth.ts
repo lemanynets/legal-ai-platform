@@ -349,3 +349,30 @@ export function updateSessionPlan(plan: string): void {
   cachedSession = { ...session, plan };
   persistSession(cachedSession);
 }
+
+/**
+ * Зберігає сесію з JWT-токена та даних користувача.
+ * Використовується KepLoginButton після успішної верифікації КЕП.
+ */
+export async function persistSessionFromToken(
+  token: string,
+  user: { id: string; email: string; name?: string },
+): Promise<UserSession> {
+  const payload = safeDecodeTokenPayload(token);
+  const userId = String(payload.sub || user.id || "").trim() || user.email.split("@")[0];
+  const email = user.email || String(payload.email || "");
+  const name =
+    user.name ||
+    String(payload.full_name || payload.email || email.split("@")[0]);
+
+  const session = buildSession({
+    userId,
+    email,
+    name,
+    token,
+    fallbackPlan: "PRO",
+  });
+  cachedSession = session;
+  persistSession(session);
+  return session;
+}

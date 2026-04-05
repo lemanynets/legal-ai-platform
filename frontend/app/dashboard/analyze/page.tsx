@@ -1,20 +1,29 @@
 "use client";
 
 import Link from "next/link";
-import React, { FormEvent, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import React, { FormEvent, Suspense, useEffect, useState } from "react";
 
 import { getToken, getUserId } from "@/lib/auth";
 import {
   analyzeIntake,
   analyzeIntakeStream,
   analyzeGdprCompliance,
+  analyzePrecedentMap,
   createCase,
+  createStrategyBlueprint,
+  runJudgeSimulation,
+  autoProcessDecisionAnalysis,
   type AnalysisComment,
   type ContractAnalysisHistoryResponse,
   type GdprComplianceResponse,
   type ContractAnalysisItem,
   type DocumentIntakeResponse,
   type StreamEvent,
+  type PrecedentMapResponse,
+  type StrategyBlueprintResponse,
+  type JudgeSimulationResponse,
+  type DecisionAnalysisResponse,
   getCase,
   getCases,
   getContractAnalysisHistory,
@@ -26,6 +35,283 @@ import {
 } from "@/lib/api";
 
 const CASE_LAW_SEED_KEY = "legal_ai_case_law_seed_v1";
+
+// ---------------------------------------------------------------------------
+// Litigation tab — strategy pipeline (intake → precedent map → blueprint → judge)
+// ---------------------------------------------------------------------------
+function LitigationTab() {
+  const [file, setFile] = useState<File | null>(null);
+  const [decisionFile, setDecisionFile] = useState<File | null>(null);
+  const [stage, setStage] = useState<"" | "intake" | "precedent" | "strategy" | "judge" | "decision">("") ;
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const [intake, setIntake] = useState<DocumentIntakeResponse | null>(null);
+  const [precedentMap, setPrecedentMap] = useState<PrecedentMapResponse | null>(null);
+  const [strategy, setStrategy] = useState<StrategyBlueprintResponse | null>(null);
+  const [judgeResult, setJudgeResult] = useState<JudgeSimulationResponse | null>(null);
+  const [decisionResult, setDecisionResult] = useState<DecisionAnalysisResponse | null>(null);
+
+  const step = !intake ? 1 : !precedentMap ? 2 : !strategy ? 3 : 4;
+
+  async function handleIntake(e: FormEvent) {
+    e.preventDefault();
+    if (!file) { setError("Оберіть файл для аналізу."); return; }
+    setStage("intake"); setError(""); setInfo("");
+    try {
+      const res = await analyzeIntake({ file }, getToken(), getUserId());
+      setIntake(res);
+      setPrecedentMap(null); setStrategy(null); setJudgeResult(null);
+      setInfo(`Intake: ${res.classified_type} — ${res.subject_matter}`);
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setStage(""); }
+  }
+
+  async function handlePrecedentMap() {
+    if (!intake) return;
+    setStage("precedent"); setError(""); setInfo("");
+    try {
+      const res = await analyzePrecedentMap(intake.id, { limit: 15 }, getToken(), getUserId());
+      setPrecedentMap(res);
+      setInfo(`Прецедентна карта: ${res.refs.length} рішень.`);
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setStage(""); }
+  }
+
+  async function handleStrategy() {
+    if (!intake) return;
+    setStage("strategy"); setError(""); setInfo("");
+    try {
+      const res = await createStrategyBlueprint(
+        { intake_id: intake.id, regenerate: true, refresh_precedent_map: false, precedent_limit: 15 },
+        getToken(), getUserId()
+      );
+      setStrategy(res);
+      setInfo("Стратегічний план готовий.");
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setStage(""); }
+  }
+
+  async function handleJudge() {
+    if (!strategy) return;
+    setStage("judge"); setError(""); setInfo("");
+    try {
+      const res = await runJudgeSimulation({ strategy_id: strategy.id }, getToken());
+      setJudgeResult(res);
+      setInfo("Симуляцію судді завершено.");
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setStage(""); }
+  }
+
+  async function handleDecisionAnalysis(e: FormEvent) {
+    e.preventDefault();
+    if (!decisionFile) { setError("Оберіть файл рішення суду."); return; }
+    setStage("decision"); setError(""); setInfo("");
+    try {
+      const res = await autoProcessDecisionAnalysis({ file: decisionFile }, getToken(), getUserId());
+      setDecisionResult(res);
+      setInfo("Аналіз рішення завершено.");
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setStage(""); }
+  }
+
+  const isLoading = Boolean(stage);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+      {error && (
+        <div className="preflight-block">
+          <span style={{ color: "var(--danger)" }}>Помилка: {error}</span>
+        </div>
+      )}
+      {info && (
+        <div className="card-elevated" style={{ padding: "12px 16px", borderLeft: "3px solid var(--success)", color: "var(--success)" }}>
+          {info}
+        </div>
+      )}
+
+      {/* Step indicators */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px" }}>
+        {[
+          { num: 1, label: "Intake аналіз", active: step === 1, done: step > 1 },
+          { num: 2, label: "Прецедентна карта", active: step === 2, done: step > 2 },
+          { num: 3, label: "Стратегічний план", active: step === 3, done: step > 3 },
+          { num: 4, label: "Симуляція судді", active: step === 4, done: false },
+        ].map(({ num, label, active, done }) => (
+          <div key={num} className="card-elevated" style={{
+            padding: "14px 16px",
+            border: `1px solid ${done ? "rgba(16,185,129,0.3)" : active ? "rgba(212,168,67,0.3)" : "rgba(255,255,255,0.05)"}`,
+            background: done ? "rgba(16,185,129,0.06)" : active ? "rgba(212,168,67,0.06)" : "rgba(255,255,255,0.02)",
+          }}>
+            <div style={{ fontSize: "10px", fontWeight: 800, textTransform: "uppercase", color: done ? "var(--success)" : active ? "var(--gold-400)" : "var(--text-muted)", marginBottom: "6px" }}>Крок {num}</div>
+            <div style={{ fontWeight: 600, color: "#fff", fontSize: "13px" }}>{label}</div>
+            <div style={{ fontSize: "11px", color: done ? "var(--success)" : active ? "var(--gold-400)" : "var(--text-muted)", marginTop: "4px" }}>
+              {done ? "Готово" : active ? "Поточний" : "Очікує"}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Intake form */}
+      <div className="card-elevated" style={{ padding: "24px" }}>
+        <h3 style={{ marginBottom: "16px", fontSize: "16px" }}>Крок 1: Стратегічний Intake</h3>
+        <form onSubmit={handleIntake} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          <div>
+            <label className="form-label">Файл документа (PDF, DOCX, TXT)</label>
+            <input type="file" className="form-input" accept=".pdf,.docx,.doc,.txt"
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+          </div>
+          <button type="submit" className="btn btn-primary" disabled={isLoading} style={{ alignSelf: "flex-start" }}>
+            {stage === "intake" ? "Аналізую..." : "Запустити Intake"}
+          </button>
+        </form>
+        {intake && (
+          <div style={{ marginTop: "16px", display: "flex", flexDirection: "column", gap: "8px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px", marginTop: "8px" }}>
+              {[
+                ["Тип документа", intake.classified_type],
+                ["Предмет", intake.subject_matter],
+                ["Роль клієнта", intake.primary_party_role],
+              ].map(([label, val]) => (
+                <div key={label} style={{ background: "rgba(255,255,255,0.03)", borderRadius: "8px", padding: "10px" }}>
+                  <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase", marginBottom: "4px" }}>{label}</div>
+                  <div style={{ color: "#fff", fontSize: "13px", fontWeight: 600 }}>{val || "—"}</div>
+                </div>
+              ))}
+            </div>
+            <button className="btn btn-secondary" disabled={isLoading} style={{ alignSelf: "flex-start", marginTop: "8px" }}
+              onClick={handlePrecedentMap}>
+              {stage === "precedent" ? "Будую карту..." : "Крок 2: Побудувати прецедентну карту"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Precedent map results */}
+      {precedentMap && (
+        <div className="card-elevated" style={{ padding: "24px" }}>
+          <h3 style={{ marginBottom: "16px", fontSize: "16px" }}>Прецедентна карта ({precedentMap.refs.length} рішень)</h3>
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "240px", overflowY: "auto" }}>
+            {precedentMap.refs.slice(0, 10).map((ref, i) => (
+              <div key={i} style={{ background: "rgba(255,255,255,0.03)", borderRadius: "8px", padding: "10px 12px" }}>
+                <div style={{ fontWeight: 600, color: "#fff", fontSize: "13px" }}>{ref.case_number || ref.decision_id}</div>
+                <div style={{ fontSize: "12px", color: "var(--text-secondary)", marginTop: "2px" }}>{ref.court_name} · {ref.relevance_score != null ? `Релевантність: ${ref.relevance_score}` : ""}</div>
+              </div>
+            ))}
+          </div>
+          <button className="btn btn-secondary" disabled={isLoading} style={{ alignSelf: "flex-start", marginTop: "12px" }}
+            onClick={handleStrategy}>
+            {stage === "strategy" ? "Будую стратегію..." : "Крок 3: Стратегічний план"}
+          </button>
+        </div>
+      )}
+
+      {/* Strategy blueprint */}
+      {strategy && (
+        <div className="card-elevated" style={{ padding: "24px" }}>
+          <h3 style={{ marginBottom: "16px", fontSize: "16px" }}>Стратегічний план</h3>
+          {strategy.win_probability != null && (
+            <div style={{ marginBottom: "12px", padding: "10px 14px", background: "rgba(212,168,67,0.08)", borderRadius: "8px", border: "1px solid rgba(212,168,67,0.2)" }}>
+              <span style={{ color: "var(--gold-400)", fontWeight: 700 }}>Прогноз перемоги: {strategy.win_probability}%</span>
+            </div>
+          )}
+          {strategy.swot_analysis?.strengths && strategy.swot_analysis.strengths.length > 0 && (
+            <div style={{ marginBottom: "12px" }}>
+              <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px", textTransform: "uppercase" }}>Сильні сторони</div>
+              <ul style={{ paddingLeft: "18px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                {strategy.swot_analysis.strengths.slice(0, 4).map((arg, i) => (
+                  <li key={i} style={{ fontSize: "13px", color: "var(--text-secondary)" }}>{arg}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <button className="btn btn-secondary" disabled={isLoading} style={{ alignSelf: "flex-start" }}
+            onClick={handleJudge}>
+            {stage === "judge" ? "Симулюю суддю..." : "Крок 4: Симуляція судді"}
+          </button>
+        </div>
+      )}
+
+      {/* Judge simulation */}
+      {judgeResult && (
+        <div className="card-elevated" style={{ padding: "24px" }}>
+          <h3 style={{ marginBottom: "16px", fontSize: "16px" }}>Симуляція судді</h3>
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            <div style={{ padding: "12px", background: "rgba(255,255,255,0.03)", borderRadius: "8px" }}>
+              <div style={{ fontSize: "11px", color: "var(--text-muted)", textTransform: "uppercase", marginBottom: "4px" }}>Прогноз вердикту</div>
+              <div style={{ color: "var(--gold-400)", fontWeight: 700, fontSize: "18px" }}>{judgeResult.verdict_probability}%</div>
+            </div>
+            <div style={{ padding: "12px", background: "rgba(255,255,255,0.03)", borderRadius: "8px" }}>
+              <div style={{ fontSize: "11px", color: "var(--text-muted)", textTransform: "uppercase", marginBottom: "4px" }}>Персона судді</div>
+              <div style={{ color: "#fff", fontSize: "13px" }}>{judgeResult.judge_persona}</div>
+            </div>
+            {judgeResult.key_vulnerabilities.length > 0 && (
+              <div>
+                <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px", textTransform: "uppercase" }}>Ключові вразливості</div>
+                <ul style={{ paddingLeft: "18px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                  {judgeResult.key_vulnerabilities.slice(0, 4).map((c, i) => (
+                    <li key={i} style={{ fontSize: "13px", color: "var(--text-secondary)" }}>{c}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {judgeResult.suggested_corrections.length > 0 && (
+              <div>
+                <div style={{ fontSize: "12px", color: "var(--success)", marginBottom: "6px", textTransform: "uppercase" }}>Рекомендації щодо виправлень</div>
+                <ul style={{ paddingLeft: "18px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                  {judgeResult.suggested_corrections.slice(0, 4).map((c, i) => (
+                    <li key={i} style={{ fontSize: "13px", color: "var(--text-secondary)" }}>{c}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Decision analysis section */}
+      <div className="card-elevated" style={{ padding: "24px", borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+        <h3 style={{ marginBottom: "8px", fontSize: "16px" }}>Аналіз судового рішення</h3>
+        <p style={{ color: "var(--text-secondary)", fontSize: "13px", marginBottom: "16px" }}>
+          Завантажте наявне рішення суду для детального розбору та рекомендацій.
+        </p>
+        <form onSubmit={handleDecisionAnalysis} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          <div>
+            <label className="form-label">Файл рішення (PDF, DOCX, TXT)</label>
+            <input type="file" className="form-input" accept=".pdf,.docx,.doc,.txt"
+              onChange={(e) => setDecisionFile(e.target.files?.[0] ?? null)} />
+          </div>
+          <button type="submit" className="btn btn-primary" disabled={isLoading} style={{ alignSelf: "flex-start" }}>
+            {stage === "decision" ? "Аналізую рішення..." : "Аналізувати рішення"}
+          </button>
+        </form>
+        {decisionResult && (
+          <div style={{ marginTop: "16px", display: "flex", flexDirection: "column", gap: "10px" }}>
+            <div style={{ padding: "12px", background: "rgba(255,255,255,0.03)", borderRadius: "8px" }}>
+              <div style={{ fontSize: "11px", color: "var(--text-muted)", textTransform: "uppercase", marginBottom: "4px" }}>Резюме спору</div>
+              <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>{decisionResult.dispute_summary}</div>
+            </div>
+            {decisionResult.final_conclusion && (
+              <div style={{ padding: "12px", background: "rgba(16,185,129,0.05)", borderRadius: "8px", border: "1px solid rgba(16,185,129,0.2)" }}>
+                <div style={{ fontSize: "11px", color: "var(--success)", textTransform: "uppercase", marginBottom: "4px" }}>Висновок</div>
+                <div style={{ color: "var(--text-secondary)", fontSize: "13px" }}>{decisionResult.final_conclusion}</div>
+              </div>
+            )}
+            {decisionResult.cassation_vulnerabilities.length > 0 && (
+              <div>
+                <div style={{ fontSize: "12px", color: "var(--text-muted)", marginBottom: "6px", textTransform: "uppercase" }}>Вразливості для касації</div>
+                <ul style={{ paddingLeft: "18px", display: "flex", flexDirection: "column", gap: "4px" }}>
+                  {decisionResult.cassation_vulnerabilities.slice(0, 5).map((r, i) => (
+                    <li key={i} style={{ fontSize: "13px", color: "var(--text-secondary)" }}>{r}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function riskTone(level?: string | null) {
   const value = String(level || "").toLowerCase();
@@ -52,7 +338,10 @@ async function runWithConcurrency<T>(
   }
 }
 
-export default function AnalyzePage() {
+function AnalyzePageInner() {
+  const searchParams = useSearchParams();
+  const mode = searchParams.get("mode") || "quick";
+
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [quickFileName, setQuickFileName] = useState("");
   const [quickText, setQuickText] = useState("");
@@ -294,20 +583,52 @@ export default function AnalyzePage() {
     <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
       <div className="section-header">
         <div>
-          <h1 className="section-title">AI Аналізатор (Усі види)</h1>
+          <h1 className="section-title">AI Аналіз</h1>
           <p className="section-subtitle">
-            Завантажуйте один або декілька документів для intake-аналізу та швидкого огляду договорів.
+            {mode === "litigation"
+              ? "Стратегічний аналіз: intake → прецеденти → план → симуляція судді + аналіз рішень."
+              : "Швидкий аналіз документів: intake, ризики договору, GDPR-відповідність."}
           </p>
         </div>
       </div>
 
-      {error && (
+      {/* Mode tabs */}
+      <div style={{ display: "flex", gap: "8px", borderBottom: "1px solid rgba(255,255,255,0.07)", paddingBottom: "0" }}>
+        {[
+          { key: "quick", label: "Швидкий аналіз" },
+          { key: "litigation", label: "Судовий аналіз" },
+        ].map(({ key, label }) => (
+          <Link
+            key={key}
+            href={`/dashboard/analyze?mode=${key}`}
+            style={{
+              display: "inline-block",
+              padding: "10px 20px",
+              textDecoration: "none",
+              fontSize: "14px",
+              fontWeight: mode === key ? 700 : 400,
+              color: mode === key ? "var(--gold-400)" : "var(--text-secondary)",
+              borderBottom: mode === key ? "2px solid var(--gold-400)" : "2px solid transparent",
+              marginBottom: "-1px",
+              transition: "all 0.2s",
+            }}
+          >
+            {label}
+          </Link>
+        ))}
+      </div>
+
+      {/* Litigation mode */}
+      {mode === "litigation" && <LitigationTab />}
+
+      {/* Quick mode — existing content below */}
+      {mode !== "litigation" && error && (
         <div className="preflight-block">
           <span style={{ color: "var(--danger)", whiteSpace: "pre-wrap" }}>Помилка: {error}</span>
         </div>
       )}
 
-      {info && (
+      {mode !== "litigation" && info && (
         <div
           className="card-elevated"
           style={{ padding: "12px 16px", borderLeft: "3px solid var(--success)", color: "var(--success)" }}
@@ -316,6 +637,7 @@ export default function AnalyzePage() {
         </div>
       )}
 
+      {mode !== "litigation" && <>
       {Object.keys(intakeErrors).length > 0 && (
         <div className="card-elevated" style={{ padding: "16px", background: "rgba(239, 68, 68, 0.05)", border: "1px solid rgba(239, 68, 68, 0.15)" }}>
           <h4 style={{ color: "var(--danger)", marginBottom: "12px" }}>Помилки аналізу файлів</h4>
@@ -1103,6 +1425,15 @@ export default function AnalyzePage() {
           </div>
         </div>
       )}
+      </>}
     </div>
+  );
+}
+
+export default function AnalyzePage() {
+  return (
+    <Suspense fallback={<div style={{ padding: "24px", color: "var(--text-secondary)" }}>Завантаження...</div>}>
+      <AnalyzePageInner />
+    </Suspense>
   );
 }
